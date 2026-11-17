@@ -1,6 +1,6 @@
 # Trace Runtime
 
-Trace Runtime is the local-first execution and state foundation for Trace. Trace's current product direction is non-linear collaboration around the same matter: people, knowledge, teams, and Agents can branch, compare, hand off bounded work, receive results in context, and reopen a judgment. This repository provides runtime and domain support for that direction; source presence or a successful build does not prove every product flow or experience is complete.
+Trace Runtime is the local-first execution and state foundation for Trace. It contains runtime and domain packages, data protocols and storage, Agent/MCP/Codex host adapters, integrations, SDKs, templates, and the local Runtime host. Product interaction design and web experiences are maintained separately; this repository's package map is an engineering boundary, not a product-module definition. Source presence or a successful build does not prove every product flow or experience is complete.
 
 ## Repository scope
 
@@ -8,9 +8,9 @@ This repository owns the runtime services and domain packages, data protocols an
 
 User project databases, private profiles, credentials, local logs, generated builds, and dependency caches are not source inputs. The Runtime may read or create project state only through the documented, explicit project/profile boundaries.
 
-## Runtime module map
+## Implementation package groups
 
-The seven maintainer groups are documented in [packages/README](packages/README.md):
+The seven groups in [packages/README](packages/README.md) describe implementation ownership and code organization. They are not the user-facing product modules, nor a prescribed sequence of product activities; those boundaries are maintained separately from this Runtime-only repository.
 
 1. Core
 2. Collaboration
