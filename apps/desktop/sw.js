@@ -1,0 +1,124 @@
+// Trace local-first web workspace — minimal offline asset cache.
+// API requests (/api/web/*) and dynamic ES module fetches always go to the network.
+const CACHE = 'trace-web-v5';
+const STATUS_TYPE = 'trace-sw-status';
+const PRECACHE = [
+  './',
+  './index.html',
+  './legacy.html',
+  './src/web-main.js',
+  './src/main.js',
+  './src/home.js',
+  './src/home-model.js',
+  './src/home-icons.js',
+  './src/home.css',
+  './src/home/scene-glass.js',
+  './src/attention/attention-home.mjs',
+  './src/attention/attention-home.css',
+  './src/attention/attention-canvas.mjs',
+  './src/attention/attention-canvas.css',
+  './src/attention/attention-projection.mjs',
+  './src/attention/attention-reader.mjs',
+  './src/attention/attention-reader.css',
+  './src/attention/camera.mjs',
+  './src/attention/geometry.mjs',
+  './src/style.css',
+  './src/matters/matters-screen.mjs',
+  './src/matters/matters-model.mjs',
+  './src/matters/matters.css',
+  './runtime/product-workspace/index.mjs',
+  './runtime/product-workspace/bridge.mjs',
+  './runtime/product-workspace/commands.mjs',
+  './runtime/product-workspace/demo-workspace.mjs',
+  './runtime/product-workspace/chain-model.mjs',
+  './runtime/product-workspace/comparison-model.mjs',
+  './runtime/product-workspace/worksite-model.mjs',
+  './runtime/product-workspace/scope-contract.mjs',
+  './src/product/library.mjs',
+  './src/product/assets.mjs',
+  './src/product/agent-panel.mjs',
+  './src/product/zhihu-panel.mjs',
+  './src/product/chain-screen.mjs',
+  './src/product/chain-helpers.mjs',
+  './src/product/chain.css',
+  './src/product/comparison-screen.mjs',
+  './src/product/comparison.css',
+  './src/product/worksite-screen.mjs',
+  './src/product/worksite-icons.mjs',
+  './src/product/worksite.css',
+  './src/product/web.css',
+  './src/vendor/anime.esm.js',
+  './src/vendor/d3-attention.bundle.mjs',
+  './src/vendor/shape-only.mjs',
+  './public/home/environment.png',
+  './public/home/bird-perched.png',
+  './public/home/bird-takeoff.png',
+  './public/home/fonts/TraceHomeSerif-fixed.woff2',
+  './public/home/fonts/TraceHomeSans-fixed.woff2',
+  './public/product/fonts/TraceSerif.woff2',
+  './public/product/fonts/TraceSans.ttf',
+  './public/matters/environment.png',
+];
+
+async function reportStatus(message) {
+  // Only send a fixed, allowlisted status. The install error can contain local
+  // paths or cache implementation details and must never cross this boundary.
+  try {
+    const clients = await self.clients.matchAll({type: 'window', includeUncontrolled: true});
+    for (const client of clients) {
+      try { client.postMessage(message); } catch { /* a closing tab is harmless */ }
+    }
+  } catch { /* status reporting must not change the install result */ }
+}
+
+async function installPrecache() {
+  try {
+    const cache = await caches.open(CACHE);
+    await cache.addAll(PRECACHE);
+  } catch {
+    await reportStatus({type: STATUS_TYPE, state: 'degraded', code: 'PRECACHE_FAILED'});
+    // Keep the rejection: the browser must mark this worker redundant instead
+    // of activating a worker whose offline dependency set is incomplete.
+    throw new Error('TRACE_SW_PRECACHE_FAILED');
+  }
+  await reportStatus({type: STATUS_TYPE, state: 'ready'});
+  self.skipWaiting();
+}
+
+self.addEventListener('install', event => {
+  // A missing renderer dependency must fail installation rather than leave an
+  // apparently installed worker that will return offline 504s later. The page
+  // observes the safe status message and continues its normal online startup.
+  event.waitUntil(installPrecache());
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))));
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', event => {
+  const req = event.request;
+  if (req.method !== 'GET') return;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  if (url.pathname.startsWith('/api/')) return; // never cache workspace state
+  event.respondWith((async () => {
+    try {
+      const fresh = await fetch(req);
+      if (fresh.ok && (req.destination === 'script' || req.destination === 'style' || req.destination === 'image' || req.destination === 'font')) {
+        const cache = await caches.open(CACHE);
+        cache.put(req, fresh.clone());
+      }
+      return fresh;
+    } catch {
+      const cached = await caches.match(req);
+      if (cached) return cached;
+      if (req.mode === 'navigate') {
+        const fallback = await caches.match('./index.html');
+        if (fallback) return fallback;
+      }
+      return new Response('', { status: 504, statusText: 'Offline' });
+    }
+  })());
+});

@@ -1,0 +1,16 @@
+{
+  "name": "@trace/product-application",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@trace/collaboration-context": "workspace:*",
+    "@trace/context": "workspace:*",
+    "@trace/instance": "workspace:*",
+    "@trace/runtime": "workspace:*",
+    "@trace/template-catalog": "workspace:*",
+    "@trace/template-contract": "workspace:*",
+    "@trace/host-codex-hooks": "workspace:*",
+    "@trace/protocol": "workspace:*"
+  }
+}

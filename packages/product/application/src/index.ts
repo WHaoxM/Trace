@@ -1,0 +1,604 @@
+/**
+ * Product-facing application service shared by host adapters.
+ *
+ * It deliberately returns summaries and stable proposal receipts rather than
+ * source bodies, prompts, credentials, or filesystem roots. CLI presentation
+ * may migrate here incrementally; MCP and a future desktop host use this API
+ * directly instead of spawning a CLI process.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import {createHash} from 'node:crypto';
+import {fileURLToPath} from 'node:url';
+import {ProtocolError} from '../../../core/protocol/src/index.js';
+import {discoverRuntimeRoot, TraceRuntime} from '../../../core/runtime/src/index.js';
+import {
+  initializeProject,
+  loadLockedProjectSourceProfile,
+  loadProjectActivationConfiguration,
+  migrateProjectActivationConfiguration,
+  previewProjectInitialization,
+  updateProjectActivationConfiguration,
+  validateProjectInstanceDescriptor,
+  type ProjectActivationConfigurationInput,
+  type ProjectInstanceDescriptor,
+  type ProjectSourceMode,
+  type ProjectSourceProfileInput,
+} from '../../../core/instance/src/index.js';
+import {compileCollaborationContext, validateCollaborationModel, validateSourceActivationManifest} from '../../../core/collaboration-context/src/index.js';
+import {buildContextSkillPackage, type ContextSkillPackage} from '../../../core/context/src/index.js';
+import {SELECTABLE_TEMPLATES} from '../../../template/catalog/src/index.js';
+import {validateTemplateManifest} from '../../../template/contract/src/index.js';
+import {CodexHookInstaller, type CodexHookPreview} from '../../../host/codex-hooks/src/index.js';
+
+export interface ProductProjectContext {
+  project_dir: string;
+  trace_dir: string;
+  state_file: string;
+  descriptor: ProjectInstanceDescriptor;
+  source_profile: ProjectSourceProfileInput;
+}
+
+export interface ProductProposal<T extends string = string> {
+  proposal_id: string;
+  operation: T;
+  state_fingerprint: string;
+  requires_user_adoption: true;
+  summary: Record<string, unknown>;
+}
+
+export interface ProjectInitializeInput {
+  project_dir?: string;
+  template_id?: string;
+  source_mode?: ProjectSourceMode;
+  source_profile?: ProjectSourceProfileInput;
+  user_id?: string;
+}
+
+export interface ProfileUpdateInput {
+  project_dir?: string;
+  configuration: ProjectActivationConfigurationInput;
+}
+
+export interface CodexHookInput {project_dir?: string; hooks_file?: string;}
+
+export interface ContextSkillReceiveInput {
+  project_dir: string;
+  host_session_id: string;
+}
+
+export interface ContextSkillReceiveResult {
+  package: ContextSkillPackage;
+  receipt: {
+    receipt_id: string;
+    status: 'received';
+    session_id: string;
+    project_id: string;
+    package_id: string;
+    content_sha256: string;
+    activated_refs: string[];
+    not_persisted: string[];
+  };
+  user_notice: string;
+}
+
+type JsonRecord = Record<string, unknown>;
+
+function sha256(value: string): string { return createHash('sha256').update(value, 'utf8').digest('hex'); }
+function safeJson(value: unknown): string { return JSON.stringify(sortValue(value)); }
+function sortValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortValue);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value as JsonRecord).sort(([left], [right]) => left.localeCompare(right)).map(([key, child]) => [key, sortValue(child)]));
+  return value;
+}
+function proposalId(operation: string, state: unknown): string { return `trace-proposal:${operation}:${sha256(safeJson(state)).slice(0, 24)}`; }
+function fileHash(file: string): string | null { return fs.existsSync(file) ? sha256(fs.readFileSync(file, 'utf8')) : null; }
+function readObject(file: string, label: string): JsonRecord {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('not an object');
+    return value as JsonRecord;
+  } catch { throw new ProtocolError('PROJECT_INVALID', `${label} is invalid: ${file}`); }
+}
+function absoluteDirectory(value: string | undefined, label: string): string {
+  const result = path.resolve(value ?? process.cwd());
+  if (!fs.existsSync(result) || !fs.statSync(result).isDirectory()) throw new ProtocolError('INVALID_INPUT', `${label} must be an existing directory`);
+  return result;
+}
+function redactedPath(root: string, target: string): string {
+  const relative = path.relative(root, target);
+  return relative && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative.replaceAll(path.sep, '/') : '<outside-project>';
+}
+function runtimeRoot(): string {
+  const explicit = process.env.TRACE_RUNTIME_ROOT;
+  if (explicit !== undefined && !path.isAbsolute(explicit)) throw new ProtocolError('IO_ERROR', 'TRACE_RUNTIME_ROOT must be an absolute directory');
+  try {
+    return discoverRuntimeRoot(explicit === undefined ? [process.cwd(), path.dirname(fileURLToPath(import.meta.url))] : [explicit], explicit !== undefined).root;
+  } catch (error) {
+    throw new ProtocolError('IO_ERROR', `Trace runtime root could not be validated: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+function runtimeVersion(): string {
+  const root = runtimeRoot();
+  const runtimeFile = path.join(root, 'runtime.json');
+  if (fs.existsSync(runtimeFile)) {
+    const value = readObject(runtimeFile, 'runtime.json');
+    if (typeof value.runtime_version === 'string' && value.runtime_version.length > 0) return value.runtime_version;
+  }
+  const packageInfo = readObject(path.join(root, 'package.json'), 'package.json');
+  if (typeof packageInfo.version !== 'string' || packageInfo.version.length === 0) throw new ProtocolError('IO_ERROR', 'Trace runtime version is unavailable');
+  return packageInfo.version;
+}
+function defaultUserId(): string {
+  const raw = process.env.TRACE_USER_ID ?? process.env.USERNAME ?? process.env.USER ?? 'local-user';
+  const normalized = raw.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120);
+  return `local-${normalized || 'user'}`;
+}
+function defaultInstanceId(projectDir: string): string {
+  const normalized = path.basename(projectDir).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
+  return `trace-${normalized || 'project'}`;
+}
+
+/** Locate one existing Trace project without treating an arbitrary file as state. */
+export function findTraceProject(directory?: string): ProductProjectContext | undefined {
+  let cursor = absoluteDirectory(directory, 'project_dir');
+  while (true) {
+    const traceDir = path.join(cursor, '.trace');
+    const descriptorFile = path.join(traceDir, 'project.json');
+    if (fs.existsSync(descriptorFile)) {
+      const descriptor = validateProjectInstanceDescriptor(readObject(descriptorFile, 'Trace project descriptor'));
+      const sourceProfile = loadLockedProjectSourceProfile({trace_dir: traceDir, source_mode: descriptor.source_mode, source_scope: descriptor.source_scope});
+      return {project_dir: cursor, trace_dir: traceDir, state_file: path.join(cursor, descriptor.state_file), descriptor, source_profile: sourceProfile};
+    }
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return undefined;
+    cursor = parent;
+  }
+}
+
+export function requireTraceProject(directory?: string): ProductProjectContext {
+  const project = findTraceProject(directory);
+  if (!project) throw new ProtocolError('PROJECT_NOT_INITIALIZED', 'No Trace project was found. Start with Trace setup in this project first.');
+  return project;
+}
+
+function activationFor(context: ProductProjectContext) {
+  return loadProjectActivationConfiguration({trace_dir: context.trace_dir, template_id: context.descriptor.template_id, source_mode: context.descriptor.source_mode, source_scope: context.descriptor.source_scope});
+}
+function withRuntime<T>(context: ProductProjectContext, fallback: T, callback: (runtime: TraceRuntime) => T): T {
+  if (!fs.existsSync(context.state_file)) return fallback;
+  const runtime = new TraceRuntime({sqliteStateFile: context.state_file});
+  try { return callback(runtime); } finally { runtime.close(); }
+}
+function configurationSummary(context: ProductProjectContext) {
+  const activation = activationFor(context);
+  return {
+    state: activation.configuration_state,
+    collaboration_model: {
+      id: activation.collaboration_model.model_id,
+      version: activation.collaboration_model.version,
+      name: activation.collaboration_model.display_name,
+    },
+    source_activation: {
+      id: activation.source_activation.manifest_id,
+      version: activation.source_activation.version,
+      name: activation.source_activation.display_name,
+      entry_point_count: activation.source_activation.entry_points.length,
+    },
+  };
+}
+
+function availableSourceProfile(context: ProductProjectContext): boolean {
+  const profile = context.source_profile;
+  if (context.descriptor.source_mode === 'empty' || profile.read_enabled === false || profile.host_retrieval?.mode === 'disabled') return false;
+  try {
+    const root = path.resolve(profile.root);
+    const prefixes = profile.host_retrieval?.allowed_prefixes ?? [profile.formal_prefix ?? 'wiki'];
+    if (prefixes.length === 0 || !fs.existsSync(root) || !fs.statSync(root).isDirectory()) return false;
+    return prefixes.every(prefix => {
+      const candidate = path.resolve(root, prefix);
+      const relative = path.relative(root, candidate);
+      return relative.length > 0 && !relative.startsWith('..') && !path.isAbsolute(relative)
+        && fs.existsSync(candidate) && fs.statSync(candidate).isDirectory();
+    });
+  } catch { return false; }
+}
+
+/**
+ * Materialize the locked collaboration profile as a virtual Codex Skill.
+ * Only the activation receipt is durable; no generated Skill is installed in
+ * the user's global discovery directory and no source body/root is returned.
+ */
+export function receiveContextSkillPackage(input: ContextSkillReceiveInput): ContextSkillReceiveResult {
+  if (!path.isAbsolute(input.project_dir)) throw new ProtocolError('INVALID_INPUT', 'project_dir must be absolute when binding a context Skill package to Codex');
+  if (!input.host_session_id || input.host_session_id.length > 512 || /[\x00-\x1f\x7f]/.test(input.host_session_id)) throw new ProtocolError('INVALID_INPUT', 'host_session_id must be a usable Codex task/session identity');
+  const context = requireTraceProject(input.project_dir);
+  const activation = activationFor(context);
+  if (activation.configuration_state !== 'locked' || activation.activation_lock === undefined) {
+    throw new ProtocolError('PROFILE_MIGRATION_REQUIRED', 'This Trace project has no locked collaboration profile. Review and adopt the profile migration before receiving a context Skill package.');
+  }
+  if (!fs.existsSync(context.state_file)) throw new ProtocolError('STATE_UNAVAILABLE', 'The Trace project state database is unavailable; no context receipt was written.');
+
+  const sourceAvailable = availableSourceProfile(context);
+  const compiled = compileCollaborationContext({
+    model: activation.collaboration_model,
+    source: activation.source_activation,
+    source_available: sourceAvailable,
+  });
+  const contextPackage = buildContextSkillPackage({
+    host_session_id: input.host_session_id,
+    project: {project_id: context.descriptor.project_id, project_label: path.basename(context.project_dir) || context.descriptor.project_id},
+    instructions: compiled.developer_context,
+    activation_lock: {lock_id: activation.activation_lock.lock_id, version: activation.activation_lock.version},
+    collaboration_model: compiled.collaboration_model,
+    source_activation: {...compiled.source_activation, available: sourceAvailable},
+  });
+
+  const threadId = `context-skill-${sha256(`${context.descriptor.project_id}:${input.host_session_id}:${contextPackage.package_id}`).slice(0, 32)}`;
+  const correlationId = `codex-context-skill:${sha256(`${context.descriptor.project_id}:${input.host_session_id}`).slice(0, 32)}`;
+  const activatedRefs = [
+    `${contextPackage.package_id}@${contextPackage.content_sha256}`,
+    `collaboration-model:${compiled.collaboration_model.model_id}@${compiled.collaboration_model.version}#${compiled.collaboration_model.sha256}`,
+    `source-activation:${compiled.source_activation.manifest_id}@${compiled.source_activation.version}#${compiled.source_activation.sha256}`,
+  ];
+  const notPersisted = ['generated SKILL.md body', 'raw cognitive-source bodies', 'absolute cognitive-source root', 'raw prompts', 'credentials', 'tool arguments'];
+  const runtime = new TraceRuntime({sqliteStateFile: context.state_file});
+  try {
+    runtime.createThread({
+      thread_id: threadId,
+      title: 'Codex context Skill package receipt',
+      current_summary: `A locked Trace context package was prepared for project ${context.descriptor.project_id}.`,
+      next_action: 'Apply the package only in its bound Codex task and project.',
+      correlation_id: correlationId,
+      causation_id: `context-skill-thread:${contextPackage.package_id}`,
+    });
+    const receipt = runtime.createReceipt({
+      thread_id: threadId,
+      receipt_kind: 'activation',
+      summary: 'Codex received the project’s locked collaboration context as a virtual Skill package.',
+      activated_refs: activatedRefs,
+      not_persisted: notPersisted,
+      next_prompts: ['Use this package for the current task', 'Read a listed cognitive-source entry only when the current work makes it relevant'],
+      correlation_id: correlationId,
+      causation_id: `context-skill-receipt:${contextPackage.package_id}`,
+    });
+    return {
+      package: contextPackage,
+      receipt: {
+        receipt_id: receipt.record_id,
+        status: 'received',
+        session_id: contextPackage.session_binding.session_id,
+        project_id: contextPackage.scope.project_id,
+        package_id: contextPackage.package_id,
+        content_sha256: contextPackage.content_sha256,
+        activated_refs: activatedRefs,
+        not_persisted: notPersisted,
+      },
+      user_notice: 'Trace 已把当前项目锁定的协作上下文作为动态 Skill 包交给本次 Codex 任务；来源入口只是导航，尚不表示任何页面已读取，也没有安装或覆盖全局 Skill。',
+    };
+  } finally { runtime.close(); }
+}
+function installationView(context: ProductProjectContext) {
+  const lockFile = path.join(context.trace_dir, 'instance', 'trace.lock.json');
+  const current = runtimeVersion();
+  const initialized = fs.existsSync(lockFile) ? readObject(lockFile, 'Trace instance lock').runtime_version : null;
+  const initializedVersion = typeof initialized === 'string' ? initialized : null;
+  return {
+    state: initializedVersion === null ? 'installation_lock_unavailable' : initializedVersion === current ? 'matching' : 'runtime_changed',
+    current_runtime_version: current,
+    initialized_runtime_version: initializedVersion,
+    project_template_version: context.descriptor.template_version,
+  };
+}
+
+/** Product-safe status: counts and identities, never source bodies or prompt text. */
+export function inspectProject(directory?: string): JsonRecord {
+  const context = requireTraceProject(directory);
+  const records = withRuntime(context, {data: [], continuity: []} as {data: ReturnType<TraceRuntime['listData']>; continuity: ReturnType<TraceRuntime['listContinuity']>}, runtime => ({data: runtime.listData(), continuity: runtime.listContinuity()}));
+  const candidates = records.data.filter(record => record.status === 'candidate');
+  const hostEvidence = records.data.filter(record => record.kind === 'host_retrieval_evidence');
+  return {
+    project: {
+      directory: context.project_dir,
+      template_id: context.descriptor.template_id,
+      template_version: context.descriptor.template_version,
+      source_mode: context.descriptor.source_mode,
+      source_scope: context.descriptor.source_scope,
+      initialized_at: context.descriptor.created_at,
+    },
+    configuration: configurationSummary(context),
+    installation: installationView(context),
+    state: {
+      persisted: fs.existsSync(context.state_file),
+      pending_review_count: candidates.length,
+      continuity_record_count: records.continuity.length,
+      host_retrieval_evidence_count: hostEvidence.length,
+    },
+  };
+}
+
+export function inspectSource(directory?: string): JsonRecord {
+  const context = requireTraceProject(directory);
+  const activation = activationFor(context);
+  return {
+    source: {
+      id: context.source_profile.source_id,
+      mode: context.descriptor.source_mode,
+      scope: context.descriptor.source_scope,
+      read_enabled: context.source_profile.read_enabled !== false,
+      write_enabled: context.source_profile.write_enabled === true,
+      host_retrieval_mode: context.source_profile.host_retrieval?.mode ?? 'native_observed',
+      allowed_prefixes: context.source_profile.host_retrieval?.allowed_prefixes ?? [context.source_profile.formal_prefix ?? 'wiki'],
+      root_visibility: 'private-not-returned',
+    },
+    activation: {
+      id: activation.source_activation.manifest_id,
+      version: activation.source_activation.version,
+      entry_points: activation.source_activation.entry_points.map(entry => ({id: entry.id, label: entry.label, kind: entry.kind, locator: entry.locator ?? null})),
+    },
+  };
+}
+
+export function listInbox(directory?: string): JsonRecord {
+  const context = requireTraceProject(directory);
+  const items = withRuntime(context, [] as JsonRecord[], runtime => runtime.listData()
+    .filter(record => record.status === 'candidate' && ['prompt_capture_proposal', 'candidate_precedent', 'capability_candidate'].includes(record.kind))
+    .map(record => {
+      const payload = record.payload as JsonRecord;
+      const title = typeof payload.intent_summary === 'string' ? payload.intent_summary
+        : typeof payload.claim === 'string' ? payload.claim
+          : typeof payload.title === 'string' ? payload.title : record.subject.id;
+      return {id: record.record_id, kind: record.kind, title, created_at: record.created_at, status: 'pending_user_review'};
+    }));
+  return {pending_count: items.length, items};
+}
+
+/** Candidate abilities are visible, but this read model never calls them published. */
+export function listAbilities(directory?: string): JsonRecord {
+  const context = requireTraceProject(directory);
+  const abilities = withRuntime(context, [] as JsonRecord[], runtime => runtime.listData()
+    .filter(record => record.kind === 'capability_candidate')
+    .map(record => {
+      const payload = record.payload as JsonRecord;
+      return {
+        id: record.record_id,
+        title: typeof payload.title === 'string' ? payload.title : record.subject.id,
+        status: record.status,
+        created_at: record.created_at,
+        lifecycle: 'candidate_not_published',
+      };
+    }));
+  return {candidate_count: abilities.length, abilities};
+}
+
+export function inspectUpgrade(directory?: string): JsonRecord {
+  const context = requireTraceProject(directory);
+  return {
+    project: {directory: context.project_dir, template_id: context.descriptor.template_id},
+    installation: installationView(context),
+    policy: {
+      automatic_project_rewrite: false,
+      old_project_behavior: 'continue_with_locked_or_legacy_compatibility_configuration',
+      action_required: 'inspect_then_explicitly_adopt_each_migration_or_profile_change',
+    },
+  };
+}
+
+function templateManifest(templateId: string) {
+  const entry = SELECTABLE_TEMPLATES.find(item => item.id === templateId);
+  if (!entry) throw new ProtocolError('INVALID_INPUT', `Unknown Trace template: ${templateId}`);
+  const file = path.join(runtimeRoot(), entry.manifest_path);
+  return validateTemplateManifest(readObject(file, 'Trace template manifest'));
+}
+function initState(input: ProjectInitializeInput) {
+  const projectDir = absoluteDirectory(input.project_dir, 'project_dir');
+  const templateId = input.template_id ?? 'trace.codex-starter';
+  const sourceMode = input.source_mode ?? 'local';
+  if (!['local', 'external', 'team', 'empty'].includes(sourceMode)) throw new ProtocolError('INVALID_INPUT', 'source_mode is invalid');
+  if ((sourceMode === 'external' || sourceMode === 'team') && input.source_profile === undefined) throw new ProtocolError('SOURCE_SELECTION_REQUIRED', `${sourceMode} source mode requires an explicit source profile`);
+  const userId = input.user_id ?? defaultUserId();
+  const runtime_version = runtimeVersion();
+  const manifest = templateManifest(templateId);
+  const initialization = previewProjectInitialization({
+    project_dir: projectDir,
+    manifest,
+    runtime_version,
+    instance_id: defaultInstanceId(projectDir),
+    user_id: userId,
+    source_mode: sourceMode as ProjectSourceMode,
+    ...(input.source_profile === undefined ? {} : {source_profile: input.source_profile}),
+  });
+  return {project_dir: projectDir, template_id: templateId, source_mode: sourceMode as ProjectSourceMode, source_profile: input.source_profile, user_id: userId, runtime_version, manifest, initialization};
+}
+
+export function proposeProjectInitialize(input: ProjectInitializeInput = {}): ProductProposal<'project_initialize'> {
+  const state = initState(input);
+  const {collaboration_model: collaborationModel, source_activation: sourceActivation, inspection} = state.initialization;
+  const fingerprint = sha256(safeJson(state));
+  return {
+    proposal_id: proposalId('project_initialize', state), operation: 'project_initialize', state_fingerprint: fingerprint, requires_user_adoption: true,
+    summary: {
+      project_directory: state.project_dir, template_id: state.template_id, source_mode: state.source_mode,
+      namespace: inspection.trace_dir_exists ? 'extend-existing-trace-namespace' : 'create-trace-namespace',
+      preserve_existing_entries: inspection.preserved_entries,
+      will_create: [...inspection.will_create_directories, ...inspection.will_create_files],
+      will_not_do: ['read external source bodies', 'install global hooks', 'overwrite or delete any pre-existing .trace path', 'open or modify existing SQLite databases'],
+      collaboration_model: {
+        model_id: collaborationModel.model_id,
+        version: collaborationModel.version,
+        display_name: collaborationModel.display_name,
+        scope: collaborationModel.scope,
+        principles: collaborationModel.principles,
+        open_discussion: collaborationModel.open_discussion,
+        explicit_execution: collaborationModel.explicit_execution,
+        epistemic_practice: collaborationModel.epistemic_practice,
+        boundaries: collaborationModel.boundaries,
+        current_focus: collaborationModel.current_focus ?? [],
+      },
+      source_activation: {
+        manifest_id: sourceActivation.manifest_id,
+        version: sourceActivation.version,
+        source_id: sourceActivation.source_id,
+        display_name: sourceActivation.display_name,
+        summary: sourceActivation.summary,
+        activation_profiles: sourceActivation.activation_profiles,
+        entry_points: sourceActivation.entry_points.map(({id, label, kind, purpose, triggers, locator}) => ({id, label, kind, purpose, triggers, ...(locator === undefined ? {} : {locator})})),
+      },
+    },
+  };
+}
+
+function assertAdopted(proposal: ProductProposal, approval: string): void {
+  if (approval !== `adopt:${proposal.proposal_id}`) throw new ProtocolError('USER_CONFIRMATION_REQUIRED', `approval must equal adopt:${proposal.proposal_id}`);
+}
+
+export function applyProjectInitialize(input: ProjectInitializeInput & {proposal_id: string; approval: string}): JsonRecord {
+  const proposal = proposeProjectInitialize(input);
+  if (proposal.proposal_id !== input.proposal_id) throw new ProtocolError('STALE_PROPOSAL', 'Project initialization proposal is stale; inspect the new proposal before adopting it.');
+  assertAdopted(proposal, input.approval);
+  const state = initState(input);
+  const result = initializeProject({
+    project_dir: state.project_dir, manifest: state.manifest, runtime_version: state.runtime_version,
+    instance_id: state.initialization.instance_id, user_id: state.user_id, source_mode: state.source_mode,
+    ...(state.source_profile === undefined ? {} : {source_profile: state.source_profile}),
+  });
+  // Match the product CLI guarantee: a fresh project is doctor/backup-ready
+  // before any hook event or MCP read asks the runtime to create state lazily.
+  const initialRuntime = new TraceRuntime({sqliteStateFile: path.join(result.project_dir, result.descriptor.state_file)});
+  initialRuntime.close();
+  return {
+    status: 'initialized', proposal_id: proposal.proposal_id,
+    project: {directory: result.project_dir, template_id: result.descriptor.template_id, source_mode: result.descriptor.source_mode},
+    configuration: {state: 'locked', collaboration_model: result.collaboration_model.display_name, source_activation: result.source_activation.display_name},
+    receipt: {created_paths: result.created_paths.map(item => redactedPath(result.project_dir, item)), preserved_paths: result.preserved_paths, source_bodies_persisted: false},
+  };
+}
+
+function legacyMigrationState(directory?: string) {
+  const context = requireTraceProject(directory);
+  const configuration = activationFor(context);
+  return {
+    project_dir: context.project_dir,
+    descriptor_hash: fileHash(path.join(context.trace_dir, 'project.json')),
+    source_profile_hash: fileHash(path.join(context.trace_dir, 'profiles', 'source.profile.json')),
+    collaboration_model: {id: configuration.collaboration_model.model_id, version: configuration.collaboration_model.version},
+    source_activation: {id: configuration.source_activation.manifest_id, version: configuration.source_activation.version},
+    configuration_state: configuration.configuration_state,
+  };
+}
+
+export function proposeProfileMigration(directory?: string): ProductProposal<'profile_migrate'> {
+  const state = legacyMigrationState(directory);
+  return {
+    proposal_id: proposalId('profile_migrate', state), operation: 'profile_migrate', state_fingerprint: sha256(safeJson(state)), requires_user_adoption: true,
+    summary: {
+      project_directory: state.project_dir,
+      current_configuration_state: state.configuration_state,
+      will_do: state.configuration_state === 'legacy_unlocked'
+        ? ['materialize the compatibility collaboration model', 'materialize the compatibility source map', 'write a hash-only activation lock and backup prior profile files']
+        : ['no configuration rewrite; the project is already locked'],
+      will_not_do: ['change selected source', 'read source bodies', 'rewrite SQLite state', 'change capabilities', 'install or replace Codex hooks'],
+    },
+  };
+}
+
+export function applyProfileMigration(input: {project_dir?: string; proposal_id: string; approval: string}): JsonRecord {
+  const proposal = proposeProfileMigration(input.project_dir);
+  if (proposal.proposal_id !== input.proposal_id) throw new ProtocolError('STALE_PROPOSAL', 'Profile migration proposal is stale; inspect the new proposal before adopting it.');
+  assertAdopted(proposal, input.approval);
+  const context = requireTraceProject(input.project_dir);
+  const migrated = migrateProjectActivationConfiguration({trace_dir: context.trace_dir, template_id: context.descriptor.template_id, source_mode: context.descriptor.source_mode, source_scope: context.descriptor.source_scope});
+  return {
+    status: migrated.migrated ? 'migrated' : 'already_locked', proposal_id: proposal.proposal_id,
+    configuration: {state: 'locked', collaboration_model: migrated.collaboration_model.display_name, source_activation: migrated.source_activation.display_name},
+    receipt: {backup_created: migrated.backup_dir !== undefined, source_changed: false, state_database_changed: false, hooks_changed: false},
+  };
+}
+
+function validatedProfileUpdate(directory: string | undefined, configuration: ProjectActivationConfigurationInput) {
+  const context = requireTraceProject(directory);
+  const collaboration = validateCollaborationModel(configuration.collaboration_model);
+  const source = validateSourceActivationManifest(configuration.source_activation);
+  if (source.source_id !== context.source_profile.source_id) throw new ProtocolError('INVALID_INPUT', 'source_activation source_id must match the current source selection');
+  return {context, configuration: {collaboration_model: collaboration, source_activation: source} satisfies ProjectActivationConfigurationInput};
+}
+
+export function proposeProfileUpdate(input: ProfileUpdateInput): ProductProposal<'profile_update'> {
+  const selected = validatedProfileUpdate(input.project_dir, input.configuration);
+  const current = activationFor(selected.context);
+  const state = {
+    project_dir: selected.context.project_dir,
+    current_lock_hash: fileHash(path.join(selected.context.trace_dir, 'instance', 'activation.lock.json')),
+    next_configuration: selected.configuration,
+  };
+  return {
+    proposal_id: proposalId('profile_update', state), operation: 'profile_update', state_fingerprint: sha256(safeJson(state)), requires_user_adoption: true,
+    summary: {
+      project_directory: selected.context.project_dir,
+      from: {collaboration_model: `${current.collaboration_model.display_name}@${current.collaboration_model.version}`, source_activation: `${current.source_activation.display_name}@${current.source_activation.version}`},
+      to: {collaboration_model: `${selected.configuration.collaboration_model.display_name}@${selected.configuration.collaboration_model.version}`, source_activation: `${selected.configuration.source_activation.display_name}@${selected.configuration.source_activation.version}`, entry_point_count: selected.configuration.source_activation.entry_points.length},
+      will_do: ['replace this project’s private collaboration model and source activation map', 'write a new hash-only activation lock', 'create a rollback backup'],
+      will_not_do: ['read source bodies', 'rewrite SQLite history', 'install or change Codex hooks'],
+    },
+  };
+}
+
+export function applyProfileUpdate(input: ProfileUpdateInput & {proposal_id: string; approval: string}): JsonRecord {
+  const proposal = proposeProfileUpdate(input);
+  if (proposal.proposal_id !== input.proposal_id) throw new ProtocolError('STALE_PROPOSAL', 'Profile update proposal is stale; inspect the new proposal before adopting it.');
+  assertAdopted(proposal, input.approval);
+  const selected = validatedProfileUpdate(input.project_dir, input.configuration);
+  const updated = updateProjectActivationConfiguration({trace_dir: selected.context.trace_dir, template_id: selected.context.descriptor.template_id, source_mode: selected.context.descriptor.source_mode, source_scope: selected.context.descriptor.source_scope, configuration: selected.configuration});
+  return {
+    status: 'updated', proposal_id: proposal.proposal_id,
+    configuration: {state: 'locked', collaboration_model: updated.collaboration_model.display_name, source_activation: updated.source_activation.display_name},
+    receipt: {backup_created: true, source_bodies_read: false, state_database_changed: false, hooks_changed: false},
+  };
+}
+
+function hookCommand(): string {
+  const root = runtimeRoot();
+  const entry = path.join(root, 'dist', 'apps', 'cli', 'src', 'main.js');
+  if (!fs.existsSync(entry)) throw new ProtocolError('IO_ERROR', 'The installed Trace CLI entrypoint is unavailable; build or install Trace before enabling Codex hooks.');
+  const quote = (value: string) => `"${value.replaceAll('"', '\\"')}"`;
+  return `${quote(process.execPath)} ${quote(entry)} internal codex hook-stdio --route-from-event-cwd`;
+}
+function hookState(input: CodexHookInput) {
+  const context = requireTraceProject(input.project_dir);
+  const installer = new CodexHookInstaller(input.hooks_file);
+  const preview = installer.preview({command: hookCommand()});
+  return {context, installer, preview};
+}
+function hookProposal(input: CodexHookInput): ProductProposal<'codex_hook_enable'> {
+  const state = hookState(input);
+  const fingerprint = {project_dir: state.context.project_dir, hooks_file: state.preview.hooks_file, before_hash: state.preview.before_hash, after_hash: state.preview.after_hash, command: hookCommand()};
+  return {
+    proposal_id: proposalId('codex_hook_enable', fingerprint), operation: 'codex_hook_enable', state_fingerprint: sha256(safeJson(fingerprint)), requires_user_adoption: true,
+    summary: {
+      scope: 'Codex user-level hooks configuration, routed per event to the nearest Trace project',
+      target_project: state.context.project_dir,
+      managed_events: state.preview.managed_events,
+      unrelated_hooks_preserved: state.preview.unrelated_hooks_preserved,
+      legacy_hook_commands_detected: state.preview.legacy_commands.length,
+      will_do: ['back up the existing Codex hook configuration', 'install Trace-managed hooks that route by event cwd'],
+      will_not_do: ['bind all future Codex sessions to this project', 'read prompt bodies into Trace state', 'replace unrelated hooks'],
+    },
+  };
+}
+export function proposeCodexHookEnable(input: CodexHookInput = {}): ProductProposal<'codex_hook_enable'> { return hookProposal(input); }
+export function applyCodexHookEnable(input: CodexHookInput & {proposal_id: string; approval: string}): JsonRecord {
+  const proposal = hookProposal(input);
+  if (proposal.proposal_id !== input.proposal_id) throw new ProtocolError('STALE_PROPOSAL', 'Codex hook proposal is stale; inspect the new proposal before adopting it.');
+  assertAdopted(proposal, input.approval);
+  const state = hookState(input);
+  const receipt = state.installer.install({command: hookCommand(), backup_root: path.join(state.context.trace_dir, 'backups', 'codex-hooks'), approval: 'approve:codex-hooks'});
+  return {
+    status: 'enabled', proposal_id: proposal.proposal_id,
+    receipt: {managed_events: receipt.managed_events, backup_created: receipt.backup_file !== null, routed_by_event_cwd: true, prompt_bodies_persisted: false},
+  };
+}
+
+export function inspectCodexHook(input: CodexHookInput = {}): JsonRecord {
+  const preview = hookState(input).preview;
+  return {managed_events: preview.managed_events, is_up_to_date: preview.before_hash === preview.after_hash, unrelated_hooks_preserved: preview.unrelated_hooks_preserved, legacy_hook_commands_detected: preview.legacy_commands.length};
+}

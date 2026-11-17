@@ -1,0 +1,54 @@
+{
+  "name": "trace-runtime",
+  "version": "0.8.0",
+  "private": true,
+  "description": "Trace TypeScript runtime packages and host adapters",
+  "type": "module",
+  "packageManager": "pnpm@10.34.5",
+  "workspaces": [
+    "packages/*",
+    "packages/*/*",
+    "apps/*"
+  ],
+  "bin": {
+    "trace": "dist/apps/cli/src/main.js",
+    "trace-runtime": "dist/apps/cli/src/main.js",
+    "trace-mcp": "dist/apps/mcp/src/main.js",
+    "trace-runtime-rpc": "dist/packages/sdk/server/src/main.js"
+  },
+  "scripts": {
+    "start": "node scripts/start-local.mjs",
+    "test:local-entry": "node --test tests/local-entry.test.mjs",
+    "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && pnpm exec tsc -p tsconfig.build.json && node scripts/materialize-mcp-dependencies.mjs",
+    "test": "pnpm build && node --test tests/*.test.mjs tests/evals/*.test.mjs",
+    "package": "pnpm build && node scripts/package.mjs",
+    "audit:templates": "node scripts/audit-templates.mjs",
+    "export:source": "node scripts/export-source.mjs",
+    "test:python": "python scripts/test-python.py",
+    "qualify:codex-app-server": "node scripts/qualify-codex-app-server.mjs",
+    "test:evals": "pnpm build && node --test tests/evals/*.test.mjs",
+    "check:all": "pnpm typecheck && pnpm audit:templates && pnpm audit:versions && pnpm audit:release-plan && pnpm test && pnpm test:python",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "audit:versions": "node scripts/audit-versions.mjs",
+    "audit:release-plan": "node scripts/audit-release-plan.mjs",
+    "eval:baseline": "pnpm build && node scripts/run-evals.mjs --variant baseline",
+    "eval:trace": "pnpm build && node scripts/run-evals.mjs --variant trace",
+    "eval:pair": "pnpm build && node scripts/run-evals-pair.mjs"
+  },
+  "devDependencies": {
+    "@changesets/cli": "catalog:devTools",
+    "@types/node": "catalog:devTools",
+    "typescript": "catalog:devTools"
+  },
+  "engines": {
+    "node": ">=22.13.0",
+    "pnpm": ">=10.34.5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "sql.js": "1.14.2",
+    "zod": "3.25.76"
+  }
+}

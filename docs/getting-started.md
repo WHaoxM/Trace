@@ -1,0 +1,108 @@
+# 第一次使用 Trace
+
+> **Codex 用户优先入口**：完成一次性 [Trace Codex Plugin](codex-plugin.md) 安装后，直接在项目中使用 `$trace 帮我开始这个项目`。本页保留 CLI 流程，适用于自动化、恢复或尚未安装 Plugin 的环境。
+
+## 你会得到什么
+
+在项目中运行 `trace init` 后，Trace 创建一个本地 `.trace/` 边界：
+
+```text
+.trace/
+├─ project.json       # 项目与模板身份，不保存外部来源绝对路径
+├─ instance/activation.lock.json # 可提交的协作模型/来源地图 hash lock
+├─ profiles/           # 本地协作模型、来源地图与来源 profile（默认不提交）
+├─ source/wiki/       # local 模式下的项目认知源
+├─ state/trace.sqlite # 本项目的运行状态
+├─ receipts/          # 用户可查看的启用、沉淀与发布回执
+├─ candidates/        # 候选产物目录
+└─ backups/           # 状态和来源操作备份
+```
+
+它不复制你的个人 Wiki，不会隐式读取外部目录，也不会让另一个项目共享状态。
+
+如果项目中已经有 `.trace/`，Trace 先检查受管理的 descriptor 和这次计划写入的**具体路径**。没有 `.trace/project.json` 且不存在路径冲突时，Trace 可以安全地补入自己的新目录与文件；proposal 会列出保留的原有条目和新增路径。原有数据库、采用回执、测试证据和未知文件不会被移动、覆盖或读取正文。目标冲突或已有受管理实例时停止，不把“非空目录”直接当成可覆盖，也不把已有实例当成新项目。
+
+## 初始化（CLI 后备入口）
+
+进入项目目录：
+
+```powershell
+trace init
+```
+
+默认创建：
+
+- `trace.codex-starter` 冷启动模板；
+- `local` 项目认知源；
+- 项目级 SQLite 状态库；
+- 尚未启用的 Codex 接续。
+
+默认还会写入一份通用的冷启动协作模型和空的来源地图。它让 Agent 在讨论时不默认把未成形的问题变成问卷、在明确执行时切换到执行、并保持候选/采用/发布边界；它不包含任何个人历史，也不声称已经理解你。
+
+需要明确选择来源时：
+
+```powershell
+trace init --source empty
+trace init --source external --source-profile <来源配置绝对路径>
+trace init --source team --source-profile <团队来源配置绝对路径>
+```
+
+外部 / 团队 profile 是用户本地配置；项目 descriptor 只保存其身份与 hash，不把外部 root 写进可提交的项目记录。
+
+## 启用 Codex hooks（CLI 后备入口）
+
+先预览：
+
+```powershell
+trace codex enable --dry-run
+```
+
+确认后：
+
+```powershell
+trace codex enable
+```
+
+Trace 添加自己管理的 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop`、`Interrupt` 和 `SessionEnd` hook，保留其他 hook，并把旧配置备份与本次 receipt 放入可追溯位置。`hooks.json` 虽然是用户级配置，但安装的是一个不绑定项目路径的路由入口：每次 Codex 事件都把自己的 `cwd` 用于发现最近的 `.trace/` 候选，再核对 descriptor、Git root 与 worktree 身份。因此在项目 A、B 都执行 enable 后，只有验证通过的项目才会使用自己的状态和来源；候选冲突或漂移时不会回退到另一个项目。
+
+这些 hook 默认只观察，不会保存 Codex prompt。若要接收原生 Host Session，必须在当前 task 中通过 MCP 的 `trace_host_session_attach`（或高级 CLI `trace codex host-session attach --session-id ... --web-state-file ...`）明确附着；之后可用 pause/detach 控制接收。附着的生命周期记录进入 Product Workspace `web.sqlite` 的独立表，不写项目 `trace.sqlite`，也不依赖 `transcript_path`。要让用户级 hook 实际送达这些表，运行 Codex 的环境还必须配置与 Product Service 相同的绝对 `TRACE_WEB_STATE_FILE`；没有 Product Service 或该变量时，hook 仍按无项目路径返回安全 `{}` no-op，不会猜测数据库位置。
+
+Trace 不会先替 Codex 挑两个页面。它只把当前项目已授权的 formal source root、范围与单轮读取预算交给 Codex；Codex 用自己的原生搜索/读取工具完成工作。随后 Trace 记录安全 evidence，区分“来源已提供 / 已搜索 / 已读取 / 未分类访问”。
+
+接着执行：
+
+```powershell
+trace profile
+trace status
+```
+
+`trace profile` 显示这次协作所依据的协作模型、来源地图和 hash lock；`trace sources` 显示来源授权和 Codex **实际**搜索/读取的 evidence。前者不是“已读取清单”，后者也不等于“长期沉淀”。如果看到“Codex：尚未启用”或“待确认沉淀：0”，这不是错误：前者表示尚未执行 enable，后者表示尚未出现需要你判断的候选。二者都不会显示 raw prompt、来源正文、绝对路径或工具参数。
+
+个人或团队适配不靠隐藏画像：将版本化的 `collaboration_model` 与 `activation_manifest` 放入本地 source profile 再初始化，或在已有项目执行 `trace profile update --file <绝对路径> --confirm true`。见[让 Agent 逐步适配使用者](personalization.md)。
+
+## 后续更新 Trace
+
+以后安装新版 runtime 或拉取新版仓库后，在已有项目中先运行：
+
+```powershell
+trace upgrade
+trace doctor
+```
+
+`trace upgrade` 只读显示当前 runtime 与项目初始化 runtime、模板 lock 和协作配置状态；它不会自动替换你的 SQLite、认知源、模板、能力、Skill 或 Codex hooks。新模板和 starter 默认只用于之后的新项目。
+
+如果 `trace profile` 显示 `legacy_unlocked`，说明这个项目来自协作 profile/hash lock 出现之前。确认后运行：
+
+```powershell
+trace profile migrate --confirm true
+```
+
+它只将正在使用的兼容协作模型/来源地图写成本地 profile 并创建 hash lock，不重新初始化，也不改动数据和来源。需要换协作方式或来源地图时，继续使用显式的 `trace profile update --file <绝对路径> --confirm true`。更新策略与边界见[版本、协议与发布](versioning.md)。
+
+## 查看 Host worker 与恢复状态
+
+启动桌面 Product Service 后，可以在“宿主会话”页查看 attached/paused/ended session、turn、finding、sensemaking job、隐私回执、worker health、Guard journal、CapabilityTrial 和 PublicationPolicy。原始 prompt/final 默认折叠且标为私有；浏览器不另存工作流状态。
+
+需要排查异步任务时使用 MCP 的 `trace_sensemaking_worker_status`（或高级 CLI `trace codex sensemaking-worker status`）；只在明确需要时调用 drain。Repository Guard 崩溃后先用 `trace_repository_recovery_preview`，只有 preview 证明分支、HEAD 与 clean state 唯一吻合才调用 reconcile。PublicationPolicy 和 capability publish 始终先 preview/producer evidence/validation，再由用户 adopt 或提供本次 approval；撤回 policy 会立即阻止后续发布。
+
+fixture-dev 是离线契约测试模式，不代表真实模型质量；没有真实 profile/cookie/远程凭据时不能声称联网验收。云同步、ADrive、多租户和远程鉴权仍不在本地启动流程内。

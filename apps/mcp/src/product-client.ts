@@ -1,0 +1,530 @@
+import {createHash, randomUUID} from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+
+export interface TraceProductArtifact {
+  title: string;
+  kind: 'file' | 'test' | 'link' | 'note';
+  path?: string;
+  url?: string;
+  digest?: string;
+}
+
+export interface TraceProductReturnInput {
+  projectDir: string;
+  workId: string;
+  deliveryId: string;
+  contextHash: string;
+  matterId: string;
+  fact: string;
+  summary?: string;
+  interpretation?: string;
+  unconfirmed?: string;
+  proposedUnderstanding?: string;
+  artifacts?: TraceProductArtifact[];
+}
+
+export interface TraceHostFindingInput {
+  turnId?: string;
+  observation: string;
+  desiredBehavior?: string;
+}
+
+export interface TraceRoutingDecisionInput {
+  proposalId: string;
+  action: 'adopt' | 'trial' | 'reject';
+  expectedRevision: number;
+  note?: string;
+}
+
+export interface TraceRoutingProposalInput {
+  findingId: string;
+}
+
+export interface TracePublicationPolicyInput {
+  scope: 'personal' | 'project' | 'cross-project';
+  targetRoot: string;
+  allowedCapabilityKinds?: string[];
+  validationRequirements?: Record<string, string>;
+  expiresAt?: string | null;
+}
+
+export interface TraceCapabilityTrialInput {
+  orchestrationId: string;
+  expectedRevision: number;
+  capabilityVersion: string;
+  capabilityHash: string;
+  scenario: string;
+  task: string;
+  expected: string;
+  host?: string;
+  model?: string;
+  toolConfig?: Record<string, unknown>;
+  evidenceRefs?: string[];
+}
+
+export interface ProductClientOptions {
+  baseUrl?: string;
+  sessionId?: string;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+  /** Optional caller-pinned identities; omitted values still receive strict
+   * service/product/protocol/runtime validation from the handshake. */
+  workspaceId?: string;
+  installationId?: string;
+  runtimeVersion?: string;
+  requireVerifiedIdentity?: boolean;
+}
+
+interface ProductErrorBody { error?: {code?: unknown; message?: unknown}; }
+
+export interface TraceServiceIdentity {
+  protocol_version?: unknown;
+  product_id?: unknown;
+  service_id?: unknown;
+  service_role?: unknown;
+  runtime_version?: unknown;
+  installation_id?: unknown;
+  workspace_id?: unknown;
+  identity_state?: unknown;
+  api_surface?: unknown;
+  [key: string]: unknown;
+}
+
+export class TraceProductClientError extends Error {
+  readonly code: string;
+  readonly status?: number;
+  constructor(code: string, message: string, status?: number) {
+    super(message);
+    this.code = code;
+    if (status !== undefined) this.status = status;
+  }
+}
+
+const TRACE_PRODUCT_ID = 'trace';
+const TRACE_PRODUCT_SERVICE_ID = 'trace-product-service';
+const RUNTIME_IDENTITY_PROTOCOL = 'trace.runtime.identity@1';
+const RUNTIME_IDENTITY_PROTOCOL_VERSION = 1;
+const IDENTITY_PATTERN = /^[^\x00-\x1f\x7f]{1,256}$/;
+const SEMVER_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const validIdentity = (value: unknown): value is string => typeof value === 'string' && IDENTITY_PATTERN.test(value) && value.trim() === value && !['__proto__', 'constructor', 'prototype'].includes(value);
+
+function identityFailure(code: string, message: string, status = 502): never {
+  throw new TraceProductClientError(code, message, status);
+}
+
+function advertisedRoutes(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string');
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  return Object.values(value as Record<string, unknown>).flatMap(item => advertisedRoutes(item));
+}
+
+function routeMatches(advertised: string, requested: string): boolean {
+  if (advertised === requested) return true;
+  const left = advertised.split('/'); const right = requested.split('/');
+  return left.length === right.length && left.every((part, index) => part.startsWith(':') || part === right[index]);
+}
+
+/** Validate the response before a Product read or write is attempted. */
+export function validateProductServiceIdentity(value: unknown, expected: {
+  workspaceId?: string;
+  installationId?: string;
+  runtimeVersion?: string;
+  requiredRoute?: string;
+  requireVerified?: boolean;
+} = {}): TraceServiceIdentity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return identityFailure('SERVICE_IDENTITY_INVALID', 'Trace endpoint did not return a service identity');
+  const identity = value as TraceServiceIdentity;
+  if (identity.protocol_version !== RUNTIME_IDENTITY_PROTOCOL_VERSION || identity.protocol !== RUNTIME_IDENTITY_PROTOCOL) return identityFailure('PROTOCOL_MISMATCH', 'Trace service protocol is not supported');
+  if (identity.product_id !== TRACE_PRODUCT_ID || identity.service_id !== TRACE_PRODUCT_SERVICE_ID) return identityFailure('SERVICE_IDENTITY_MISMATCH', 'The endpoint is not the Trace Product service');
+  if (identity.service_role !== 'product' || identity.database_role !== 'product-web') return identityFailure('SERVICE_IDENTITY_MISMATCH', 'The endpoint does not own the Trace Product database');
+  if (typeof identity.runtime_version !== 'string' || !SEMVER_PATTERN.test(identity.runtime_version)) return identityFailure('RUNTIME_VERSION_INVALID', 'Trace service did not provide a valid runtime version');
+  if (expected.runtimeVersion !== undefined && identity.runtime_version !== expected.runtimeVersion) return identityFailure('RUNTIME_VERSION_MISMATCH', 'Trace service runtime version does not match the caller', 409);
+  const requireVerified = expected.requireVerified ?? true;
+  if (!['verified', 'legacy', 'unverified'].includes(String(identity.identity_state))) return identityFailure('SERVICE_IDENTITY_INVALID', 'Trace service returned an unknown identity state');
+  if (requireVerified && identity.identity_state !== 'verified') return identityFailure('IDENTITY_UNVERIFIED', 'Trace Product identity is legacy or unverified; no state access was performed', 503);
+  if (identity.identity_state === 'verified') {
+    if (!validIdentity(identity.workspace_id) || !validIdentity(identity.installation_id)) return identityFailure('IDENTITY_MISSING', 'Trace service did not provide installation/workspace identity');
+    if (expected.workspaceId !== undefined && identity.workspace_id !== expected.workspaceId) return identityFailure('IDENTITY_MISMATCH', 'Trace workspace identity does not match the caller', 409);
+    if (expected.installationId !== undefined && identity.installation_id !== expected.installationId) return identityFailure('IDENTITY_MISMATCH', 'Trace installation identity does not match the caller', 409);
+  }
+  if (identity.identity_state !== 'verified' && (identity.workspace_id !== null || identity.installation_id !== null)) return identityFailure('SERVICE_IDENTITY_INVALID', 'Trace service returned IDs for an unverified identity');
+  if (expected.requiredRoute !== undefined && !advertisedRoutes(identity.api_surface).some(route => routeMatches(route, expected.requiredRoute!))) return identityFailure('SERVICE_API_MISMATCH', 'Trace Product service does not advertise the requested route');
+  return identity;
+}
+
+/** Shared handshake for clients that call a non-Product domain mounted by the
+ * same desktop service (for example the Zhihu provider). */
+export async function fetchProductServiceIdentity(baseUrl: string, options: {
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+  workspaceId?: string;
+  installationId?: string;
+  runtimeVersion?: string;
+  requiredRoute?: string;
+  requireVerified?: boolean;
+} = {}): Promise<TraceServiceIdentity> {
+  const origin = resolveBaseUrl(baseUrl);
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const timeoutMs = Math.max(250, Math.min(30_000, Math.floor(options.timeoutMs ?? 5_000)));
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs); timer.unref?.();
+  let response: Response;
+  try { response = await fetchImpl(`${origin}/api/runtime/identity`, {method: 'GET', redirect: 'error', headers: {'accept': 'application/json', origin, 'x-trace-runtime-protocol': String(RUNTIME_IDENTITY_PROTOCOL_VERSION)}, signal: controller.signal}); }
+  catch (error) {
+    const timedOut = error instanceof Error && error.name === 'AbortError';
+    throw new TraceProductClientError(timedOut ? 'PRODUCT_TIMEOUT' : 'PRODUCT_UNAVAILABLE', timedOut ? 'Trace product service did not respond before the local timeout' : 'Trace product service is not reachable; start or restart the local Trace desktop service');
+  } finally { clearTimeout(timer); }
+  let value: unknown;
+  try { value = JSON.parse(await response.text()); } catch { throw new TraceProductClientError('SERVICE_IDENTITY_INVALID', 'Trace endpoint returned invalid identity JSON', response.status); }
+  if (!response.ok) throw new TraceProductClientError('SERVICE_HANDSHAKE_REQUIRED', `Trace Product service identity handshake failed (${response.status})`, response.status);
+  const workspaceId = options.workspaceId ?? process.env.TRACE_WORKSPACE_ID;
+  const installationId = options.installationId ?? process.env.TRACE_INSTALLATION_ID;
+  const runtimeVersion = options.runtimeVersion ?? process.env.TRACE_EXPECTED_RUNTIME_VERSION;
+  if ((workspaceId === undefined) !== (installationId === undefined)) throw new TraceProductClientError('INVALID_EXPECTED_IDENTITY', 'workspaceId and installationId must be supplied together');
+  return validateProductServiceIdentity(value, {
+    ...(workspaceId === undefined ? {} : {workspaceId}),
+    ...(installationId === undefined ? {} : {installationId}),
+    ...(runtimeVersion === undefined ? {} : {runtimeVersion}),
+    ...(options.requiredRoute === undefined ? {} : {requiredRoute: options.requiredRoute}),
+    ...(options.requireVerified === undefined ? {} : {requireVerified: options.requireVerified}),
+  });
+}
+
+export function resolveBaseUrl(value: string): string {
+  let parsed: URL;
+  try { parsed = new URL(value); } catch { throw new TraceProductClientError('INVALID_PRODUCT_URL', 'TRACE_PRODUCT_URL must be a valid loopback URL'); }
+  const loopback = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]';
+  if (parsed.protocol !== 'http:' || !loopback || parsed.username || parsed.password || parsed.search || parsed.hash || !['', '/'].includes(parsed.pathname)) {
+    throw new TraceProductClientError('INVALID_PRODUCT_URL', 'TRACE_PRODUCT_URL must be an HTTP loopback origin without credentials or a path');
+  }
+  return parsed.origin;
+}
+
+export function currentCodexSessionId(environment: NodeJS.ProcessEnv = process.env): string {
+  const value = environment.CODEX_THREAD_ID ?? environment.CODEX_SESSION_ID;
+  if (!value || value.trim().length === 0 || value.length > 512 || /[\x00-\x1f\x7f]/.test(value)) {
+    throw new TraceProductClientError('CODEX_SESSION_UNAVAILABLE', 'Codex did not provide a usable task/session identity to the Trace MCP process');
+  }
+  return value;
+}
+
+function returnCommandId(sessionId: string, input: TraceProductReturnInput): string {
+  const digest = createHash('sha256').update(JSON.stringify({sessionId, ...input})).digest('hex');
+  return `codex-return:${digest}`;
+}
+
+function hostCommandId(operation: string, sessionId: string, input: Record<string, unknown> = {}): string {
+  const digest = createHash('sha256').update(JSON.stringify({operation, sessionId, ...input})).digest('hex');
+  return `codex-host-${operation}:${sessionId}:${digest.slice(0, 32)}`;
+}
+
+interface CanonicalProjectDirectory {
+  projectDir: string;
+  projectRealpath: string;
+  projectIdentity: string;
+}
+
+/** Reject a stale/non-directory MCP argument before it reaches the product service. */
+export function resolveProductProjectDirectory(value: string): CanonicalProjectDirectory {
+  if (typeof value !== 'string' || !path.isAbsolute(value)) {
+    throw new TraceProductClientError('INVALID_PROJECT_DIR', 'project_dir must be an absolute existing directory');
+  }
+  const projectDir = path.normalize(path.resolve(value));
+  let stat: fs.Stats;
+  try { stat = fs.statSync(projectDir); }
+  catch { throw new TraceProductClientError('INVALID_PROJECT_DIR', 'project_dir must be an existing directory'); }
+  if (!stat.isDirectory()) throw new TraceProductClientError('INVALID_PROJECT_DIR', 'project_dir must be an existing directory');
+  let projectRealpath: string;
+  try {
+    const resolveRealpath = fs.realpathSync.native ?? fs.realpathSync;
+    projectRealpath = path.normalize(resolveRealpath(projectDir));
+  } catch { throw new TraceProductClientError('INVALID_PROJECT_DIR', 'project_dir must be an existing resolvable directory'); }
+  const projectIdentity = process.platform === 'win32' ? projectRealpath.toLocaleLowerCase('en-US') : projectRealpath;
+  return {projectDir, projectRealpath, projectIdentity};
+}
+
+export class TraceProductClient {
+  readonly baseUrl: string;
+  readonly sessionId: string;
+  readonly timeoutMs: number;
+  readonly expectedWorkspaceId: string | undefined;
+  readonly expectedInstallationId: string | undefined;
+  readonly expectedRuntimeVersion: string | undefined;
+  readonly requireVerifiedIdentity: boolean;
+  private readonly fetchImpl: typeof fetch;
+  private handshakePromise: Promise<TraceServiceIdentity> | undefined;
+  // When the caller did not provide durable IDs, bind this client to the
+  // first verified service identity it sees. This keeps a long-lived MCP
+  // process from following a restarted port into another Trace workspace.
+  private discoveredWorkspaceId: string | undefined;
+  private discoveredInstallationId: string | undefined;
+
+  constructor(options: ProductClientOptions = {}) {
+    this.baseUrl = resolveBaseUrl(options.baseUrl ?? process.env.TRACE_PRODUCT_URL ?? 'http://127.0.0.1:4173');
+    this.sessionId = options.sessionId ?? currentCodexSessionId();
+    this.timeoutMs = Math.max(250, Math.min(30_000, Math.floor(options.timeoutMs ?? 5_000)));
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.expectedWorkspaceId = options.workspaceId ?? process.env.TRACE_WORKSPACE_ID;
+    this.expectedInstallationId = options.installationId ?? process.env.TRACE_INSTALLATION_ID;
+    this.expectedRuntimeVersion = options.runtimeVersion ?? process.env.TRACE_EXPECTED_RUNTIME_VERSION;
+    this.requireVerifiedIdentity = options.requireVerifiedIdentity ?? true;
+    if ((this.expectedWorkspaceId === undefined) !== (this.expectedInstallationId === undefined)) throw new TraceProductClientError('INVALID_EXPECTED_IDENTITY', 'workspaceId and installationId must be supplied together');
+    for (const [label, value] of [['workspaceId', this.expectedWorkspaceId], ['installationId', this.expectedInstallationId], ['runtimeVersion', this.expectedRuntimeVersion] as const]) {
+      if (value !== undefined && (label === 'runtimeVersion' ? typeof value !== 'string' || !SEMVER_PATTERN.test(value) : !validIdentity(value))) throw new TraceProductClientError('INVALID_EXPECTED_IDENTITY', `${label} is not a usable expected identity`);
+    }
+  }
+
+  private async ensureHandshake(requiredRoute?: string): Promise<TraceServiceIdentity> {
+    if (this.handshakePromise === undefined) {
+      const pending = (async () => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.timeoutMs); timer.unref?.();
+        let response: Response;
+        try {
+          response = await this.fetchImpl(`${this.baseUrl}/api/runtime/identity`, {method: 'GET', redirect: 'error', headers: {'accept': 'application/json', origin: this.baseUrl, 'x-trace-runtime-protocol': String(RUNTIME_IDENTITY_PROTOCOL_VERSION)}, signal: controller.signal});
+        } catch (error) {
+          const timedOut = error instanceof Error && error.name === 'AbortError';
+          throw new TraceProductClientError(timedOut ? 'PRODUCT_TIMEOUT' : 'PRODUCT_UNAVAILABLE', timedOut ? 'Trace product service did not respond before the local timeout' : 'Trace product service is not reachable; start or restart the local Trace desktop service');
+        } finally { clearTimeout(timer); }
+        let value: unknown;
+        try { value = JSON.parse(await response.text()); } catch { throw new TraceProductClientError('SERVICE_IDENTITY_INVALID', 'Trace endpoint returned invalid identity JSON', response.status); }
+        if (!response.ok) throw new TraceProductClientError('SERVICE_HANDSHAKE_REQUIRED', `Trace Product service identity handshake failed (${response.status})`, response.status);
+        const workspaceId = this.expectedWorkspaceId ?? this.discoveredWorkspaceId;
+        const installationId = this.expectedInstallationId ?? this.discoveredInstallationId;
+        const identity = validateProductServiceIdentity(value, {
+          ...(workspaceId === undefined ? {} : {workspaceId}),
+          ...(installationId === undefined ? {} : {installationId}),
+          ...(this.expectedRuntimeVersion === undefined ? {} : {runtimeVersion: this.expectedRuntimeVersion}),
+          requireVerified: this.requireVerifiedIdentity,
+        });
+        if (this.expectedWorkspaceId === undefined && this.expectedInstallationId === undefined && identity.identity_state === 'verified') {
+          this.discoveredWorkspaceId = identity.workspace_id as string;
+          this.discoveredInstallationId = identity.installation_id as string;
+        }
+        return identity;
+      })();
+      // Coalesce simultaneous operations, but do not retain a successful
+      // handshake forever. A long-lived MCP process must re-check the service
+      // before each read/write so a restarted port cannot silently point at a
+      // different Trace workspace.
+      let settled!: Promise<TraceServiceIdentity>;
+      settled = pending.finally(() => { if (this.handshakePromise === settled) this.handshakePromise = undefined; });
+      this.handshakePromise = settled;
+    }
+    const identity = await this.handshakePromise;
+    if (requiredRoute !== undefined && !advertisedRoutes(identity.api_surface).some(route => routeMatches(route, requiredRoute))) throw new TraceProductClientError('SERVICE_API_MISMATCH', 'Trace Product service does not advertise the requested route', 502);
+    return identity;
+  }
+
+  /** Explicitly validate and return the cached Product service identity. */
+  serviceIdentity(): Promise<TraceServiceIdentity> { return this.ensureHandshake(); }
+
+  private async request(route: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    await this.ensureHandshake(route);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    timer.unref?.();
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}${route}`, {
+        method: 'POST',
+        headers: {'content-type': 'application/json', origin: this.baseUrl, 'x-trace-host': 'codex-mcp', 'x-trace-runtime-protocol': String(RUNTIME_IDENTITY_PROTOCOL_VERSION)},
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      const timedOut = error instanceof Error && error.name === 'AbortError';
+      throw new TraceProductClientError(timedOut ? 'PRODUCT_TIMEOUT' : 'PRODUCT_UNAVAILABLE', timedOut
+        ? 'Trace product service did not respond before the local timeout'
+        : 'Trace product service is not reachable; start or restart the local Trace desktop service');
+    } finally { clearTimeout(timer); }
+    let value: unknown;
+    try { value = JSON.parse(await response.text()); } catch { throw new TraceProductClientError('INVALID_PRODUCT_RESPONSE', 'Trace product service returned invalid JSON', response.status); }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TraceProductClientError('INVALID_PRODUCT_RESPONSE', 'Trace product service returned an invalid response shape', response.status);
+    if (!response.ok) {
+      const error = (value as ProductErrorBody).error;
+      throw new TraceProductClientError(typeof error?.code === 'string' ? error.code : 'PRODUCT_REQUEST_FAILED', typeof error?.message === 'string' ? error.message : `Trace product request failed (${response.status})`, response.status);
+    }
+    return value as Record<string, unknown>;
+  }
+
+  receive(input: {projectDir: string; workId?: string}): Promise<Record<string, unknown>> {
+    const project = resolveProductProjectDirectory(input.projectDir);
+    const commandId = `codex-receive:${this.sessionId}:${randomUUID()}`;
+    return this.request('/api/product/codex/receive', {
+      protocolVersion: 1,
+      commandId,
+      sessionId: this.sessionId,
+      projectDir: project.projectDir,
+      ...(input.workId === undefined ? {} : {workId: input.workId}),
+    });
+  }
+
+  returnResult(input: TraceProductReturnInput): Promise<Record<string, unknown>> {
+    const project = resolveProductProjectDirectory(input.projectDir);
+    const result = {
+      matterId: input.matterId,
+      fact: input.fact,
+      ...(input.summary === undefined ? {} : {summary: input.summary}),
+      ...(input.interpretation === undefined ? {} : {interpretation: input.interpretation}),
+      ...(input.unconfirmed === undefined ? {} : {unconfirmed: input.unconfirmed}),
+      ...(input.proposedUnderstanding === undefined ? {} : {proposedUnderstanding: input.proposedUnderstanding}),
+      ...(input.artifacts === undefined ? {} : {artifacts: input.artifacts}),
+    };
+    return this.request('/api/product/codex/return', {
+      protocolVersion: 1,
+      // Use the resolved target for idempotency so a junction/symlink or a
+      // Windows case variant cannot manufacture a second return command.
+      commandId: returnCommandId(this.sessionId, {...input, projectDir: project.projectRealpath}),
+      workId: input.workId,
+      sessionId: this.sessionId,
+      projectDir: project.projectDir,
+      deliveryId: input.deliveryId,
+      contextHash: input.contextHash,
+      result,
+    });
+  }
+
+  private async read(route: string, query: Record<string, string | number | boolean | undefined> = {}): Promise<Record<string, unknown>> {
+    await this.ensureHandshake(route);
+    const url = new URL(`${this.baseUrl}${route}`);
+    for (const [key, value] of Object.entries(query)) if (value !== undefined) url.searchParams.set(key, String(value));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs); timer.unref?.();
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {method: 'GET', headers: {'accept': 'application/json', origin: this.baseUrl, 'x-trace-host': 'codex-mcp', 'x-trace-runtime-protocol': String(RUNTIME_IDENTITY_PROTOCOL_VERSION)}, signal: controller.signal});
+    } catch (error) {
+      const timedOut = error instanceof Error && error.name === 'AbortError';
+      throw new TraceProductClientError(timedOut ? 'PRODUCT_TIMEOUT' : 'PRODUCT_UNAVAILABLE', timedOut ? 'Trace product service did not respond before the local timeout' : 'Trace product service is not reachable; start or restart the local Trace desktop service');
+    } finally { clearTimeout(timer); }
+    let value: unknown; try { value = JSON.parse(await response.text()); } catch { throw new TraceProductClientError('INVALID_PRODUCT_RESPONSE', 'Trace product service returned invalid JSON', response.status); }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TraceProductClientError('INVALID_PRODUCT_RESPONSE', 'Trace product service returned an invalid response shape', response.status);
+    if (!response.ok) { const error = (value as ProductErrorBody).error; throw new TraceProductClientError(typeof error?.code === 'string' ? error.code : 'PRODUCT_REQUEST_FAILED', typeof error?.message === 'string' ? error.message : `Trace product request failed (${response.status})`, response.status); }
+    return value as Record<string, unknown>;
+  }
+
+  attachHostSession(input: {projectDir?: string} = {}): Promise<Record<string, unknown>> {
+    if (input.projectDir !== undefined && !path.isAbsolute(input.projectDir)) throw new TraceProductClientError('INVALID_PROJECT_DIR', 'project_dir must be absolute');
+    const projectRef = input.projectDir === undefined ? undefined : path.resolve(input.projectDir);
+    return this.request('/api/product/host/session/attach', {
+      protocolVersion: 1,
+      commandId: hostCommandId('attach', this.sessionId, {projectRef: projectRef ?? null}),
+      host: 'codex', sessionId: this.sessionId,
+      ...(projectRef === undefined ? {} : {projectRef}),
+    });
+  }
+
+  pauseHostSession(): Promise<Record<string, unknown>> {
+    return this.request('/api/product/host/session/pause', {
+      protocolVersion: 1,
+      commandId: hostCommandId('pause', this.sessionId),
+      host: 'codex', sessionId: this.sessionId,
+    });
+  }
+
+  detachHostSession(): Promise<Record<string, unknown>> {
+    return this.request('/api/product/host/session/detach', {
+      protocolVersion: 1,
+      commandId: hostCommandId('detach', this.sessionId),
+      host: 'codex', sessionId: this.sessionId,
+    });
+  }
+
+  captureWorkflowFinding(input: TraceHostFindingInput): Promise<Record<string, unknown>> {
+    const turnId = input.turnId;
+    if (turnId !== undefined && (!turnId || turnId.length > 512 || /[\x00-\x1f\x7f]/.test(turnId))) throw new TraceProductClientError('INVALID_TURN_ID', 'turn_id must be a usable Codex turn identity');
+    if (!input.observation || input.observation.length > 1_000_000) throw new TraceProductClientError('INVALID_FINDING', 'observation must be a non-empty bounded text value');
+    return this.request('/api/product/host/finding', {
+      protocolVersion: 1,
+      commandId: hostCommandId('finding', this.sessionId, {turnId: turnId ?? null, observation: input.observation, desiredBehavior: input.desiredBehavior ?? null}),
+      host: 'codex', sessionId: this.sessionId, ...(turnId === undefined ? {} : {turnId}),
+      observation: input.observation,
+      ...(input.desiredBehavior === undefined ? {} : {desiredBehavior: input.desiredBehavior}),
+    }).then(value => {
+      // The explicit finding is durably stored in Product Workspace and can
+      // be read from the UI/list tool when needed.  Keep the immediate MCP
+      // receipt short and avoid echoing a possibly private observation into
+      // the model transcript that requested the capture.
+      const finding = value.finding;
+      if (!finding || typeof finding !== 'object' || Array.isArray(finding)) return value;
+      const {observation: _observation, desired_behavior: _desiredBehavior, desiredBehavior: _desiredBehaviorCamel, ...safeFinding} = finding as Record<string, unknown>;
+      return {...value, finding: safeFinding, private_fields_omitted: ['observation', 'desired_behavior']};
+    });
+  }
+
+  listWorkflowFindings(): Promise<Record<string, unknown>> { return this.read('/api/product/host/findings', {host: 'codex', session_id: this.sessionId}); }
+  listRoutingProposals(): Promise<Record<string, unknown>> { return this.read('/api/product/host/routing/proposals', {host: 'codex', session_id: this.sessionId}); }
+  proposeRouting(input: TraceRoutingProposalInput): Promise<Record<string, unknown>> {
+    if (!input.findingId || input.findingId.length > 512) throw new TraceProductClientError('INVALID_FINDING_ID', 'finding_id must be a usable finding identity');
+    return this.request('/api/product/host/routing/propose', {protocolVersion: 1, commandId: hostCommandId('routing-propose', this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, findingId: input.findingId});
+  }
+  decideRouting(input: TraceRoutingDecisionInput): Promise<Record<string, unknown>> {
+    if (!input.proposalId || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) throw new TraceProductClientError('INVALID_ROUTE_DECISION', 'proposal_id and expected_revision are required');
+    return this.request('/api/product/host/routing/decide', {protocolVersion: 1, commandId: hostCommandId(`routing-${input.action}`, this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, proposalId: input.proposalId, action: input.action, expectedRevision: input.expectedRevision, ...(input.note === undefined ? {} : {note: input.note})});
+  }
+  queryActivation(input: {taskIntent?: string; projectRef?: string; includeTrial?: boolean; maxItems?: number; maxTokens?: number} = {}): Promise<Record<string, unknown>> {
+    if (input.projectRef !== undefined && !path.isAbsolute(input.projectRef)) throw new TraceProductClientError('INVALID_PROJECT_DIR', 'project_ref must be absolute');
+    const query = {host: 'codex', session_id: this.sessionId, ...(input.projectRef === undefined ? {} : {project_ref: path.resolve(input.projectRef)}), ...(input.taskIntent === undefined ? {} : {task_intent: input.taskIntent}), ...(input.includeTrial === undefined ? {} : {include_trial: input.includeTrial}), ...(input.maxItems === undefined ? {} : {max_items: input.maxItems}), ...(input.maxTokens === undefined ? {} : {max_tokens: input.maxTokens})};
+    return this.read('/api/product/host/activation/query', query);
+  }
+  markActivation(input: {receiptId: string; status: 'used' | 'affected' | 'dismissed' | 'snoozed' | 'released'; expectedRevision: number}): Promise<Record<string, unknown>> {
+    return this.request('/api/product/host/activation/mark', {protocolVersion: 1, commandId: hostCommandId(`activation-${input.status}`, this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, receiptId: input.receiptId, status: input.status, expectedRevision: input.expectedRevision});
+  }
+  listActivationHistory(): Promise<Record<string, unknown>> { return this.read('/api/product/host/activation/history', {host: 'codex', session_id: this.sessionId}); }
+  sensemakingWorkerStatus(): Promise<Record<string, unknown>> { return this.read('/api/agent/sensemaking/health'); }
+  sensemakingWorkerDrain(limit = 16): Promise<Record<string, unknown>> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) throw new TraceProductClientError('INVALID_WORKER_LIMIT', 'limit must be an integer from 1 to 1000');
+    return this.request('/api/agent/sensemaking/drain', {protocolVersion: 1, limit});
+  }
+  repositoryPreflight(input: {repoRoot: string; taskIntent?: string; executionMode?: 'local' | 'managed-worktree' | 'cloud' | 'unknown'; proposalId?: string; userRequestedCurrentBranch?: boolean}): Promise<Record<string, unknown>> {
+    if (!path.isAbsolute(input.repoRoot)) throw new TraceProductClientError('INVALID_REPOSITORY_ROOT', 'repo_root must be absolute');
+    return this.request('/api/product/host/repository/preflight', {protocolVersion: 1, commandId: hostCommandId('repository-preflight', this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, repoRoot: path.resolve(input.repoRoot), executionMode: input.executionMode ?? 'unknown', taskIntent: input.taskIntent ?? '', ...(input.proposalId === undefined ? {} : {proposalId: input.proposalId}), ...(input.userRequestedCurrentBranch === undefined ? {} : {userRequestedCurrentBranch: input.userRequestedCurrentBranch})});
+  }
+  repositoryGuardApply(input: {preflightId: string; proposalId: string; expectedStateHash: string; approval: string}): Promise<Record<string, unknown>> {
+    return this.request('/api/product/host/repository/apply', {protocolVersion: 1, commandId: hostCommandId('repository-apply', this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, preflightId: input.preflightId, proposalId: input.proposalId, expectedStateHash: input.expectedStateHash, approval: input.approval});
+  }
+  repositoryRecoveryPreview(input: {journalId?: string; commandId?: string}): Promise<Record<string, unknown>> {
+    if (input.journalId === undefined && input.commandId === undefined) throw new TraceProductClientError('INVALID_GUARD_RECOVERY', 'journal_id or command_id is required');
+    return this.request('/api/product/host/repository/recovery/preview', {protocolVersion: 1, commandId: hostCommandId('repository-recovery-preview', this.sessionId, input as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, ...(input.journalId === undefined ? {} : {journalId: input.journalId}), ...(input.commandId === undefined ? {} : {targetCommandId: input.commandId})});
+  }
+  repositoryRecoveryReconcile(journalId: string): Promise<Record<string, unknown>> {
+    if (!journalId) throw new TraceProductClientError('INVALID_GUARD_RECOVERY', 'journal_id is required');
+    return this.request('/api/product/host/repository/recovery/reconcile', {protocolVersion: 1, commandId: hostCommandId('repository-recovery-reconcile', this.sessionId, {journalId}), host: 'codex', sessionId: this.sessionId, journalId});
+  }
+  repositoryRecoveryStatus(state?: string): Promise<Record<string, unknown>> { return this.read('/api/product/host/repository/recovery/status', {state}); }
+
+  listPublicationPolicies(status?: string): Promise<Record<string, unknown>> { return this.read('/api/product/host/publication-policies', {status}); }
+  previewPublicationPolicy(input: TracePublicationPolicyInput): Promise<Record<string, unknown>> {
+    if (!path.isAbsolute(input.targetRoot)) throw new TraceProductClientError('INVALID_PUBLICATION_POLICY', 'target_root must be absolute');
+    return this.request('/api/product/host/publication-policy/preview', {protocolVersion: 1, commandId: hostCommandId('publication-policy-preview', this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, scope: input.scope, targetRoot: path.resolve(input.targetRoot), ...(input.allowedCapabilityKinds === undefined ? {} : {allowedCapabilityKinds: input.allowedCapabilityKinds}), ...(input.validationRequirements === undefined ? {} : {validationRequirements: input.validationRequirements}), ...(input.expiresAt === undefined ? {} : {expiresAt: input.expiresAt})});
+  }
+  adoptPublicationPolicy(input: TracePublicationPolicyInput & {approval: string}): Promise<Record<string, unknown>> {
+    if (!path.isAbsolute(input.targetRoot)) throw new TraceProductClientError('INVALID_PUBLICATION_POLICY', 'target_root must be absolute');
+    return this.request('/api/product/host/publication-policy/adopt', {protocolVersion: 1, commandId: hostCommandId('publication-policy-adopt', this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, scope: input.scope, targetRoot: path.resolve(input.targetRoot), allowedCapabilityKinds: input.allowedCapabilityKinds, validationRequirements: input.validationRequirements, expiresAt: input.expiresAt, approval: input.approval});
+  }
+  revokePublicationPolicy(policyId: string, expectedRevision: number, reason?: string): Promise<Record<string, unknown>> {
+    return this.request('/api/product/host/publication-policy/revoke', {protocolVersion: 1, commandId: hostCommandId('publication-policy-revoke', this.sessionId, {policyId, expectedRevision, reason: reason ?? null}), host: 'codex', sessionId: this.sessionId, policyId, expectedRevision, ...(reason === undefined ? {} : {reason})});
+  }
+  listCapabilityOrchestrations(status?: string): Promise<Record<string, unknown>> { return this.read('/api/product/host/capability/orchestrations', {host: 'codex', session_id: this.sessionId, status}); }
+  listCapabilityTrials(orchestrationId?: string): Promise<Record<string, unknown>> { return this.read('/api/product/host/capability/trials', {orchestration_id: orchestrationId}); }
+  createCapabilityTrial(input: TraceCapabilityTrialInput): Promise<Record<string, unknown>> {
+    return this.request('/api/product/host/capability/trial/create', {protocolVersion: 1, commandId: hostCommandId('capability-trial-create', this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, orchestrationId: input.orchestrationId, expectedRevision: input.expectedRevision, capabilityVersion: input.capabilityVersion, capabilityHash: input.capabilityHash, scenario: input.scenario, task: input.task, expected: input.expected, ...(input.host === undefined ? {} : {host: input.host}), ...(input.model === undefined ? {} : {model: input.model}), ...(input.toolConfig === undefined ? {} : {toolConfig: input.toolConfig}), ...(input.evidenceRefs === undefined ? {} : {evidenceRefs: input.evidenceRefs})});
+  }
+  completeCapabilityTrial(input: {trialId: string; expectedRevision: number; outcome: 'support' | 'limit' | 'challenge' | 'inconclusive'; observed: string; evidenceRefs?: string[]}): Promise<Record<string, unknown>> {
+    return this.request('/api/product/host/capability/trial/complete', {protocolVersion: 1, commandId: hostCommandId('capability-trial-complete', this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, trialId: input.trialId, expectedRevision: input.expectedRevision, outcome: input.outcome, observed: input.observed, ...(input.evidenceRefs === undefined ? {} : {evidenceRefs: input.evidenceRefs})});
+  }
+  stageCapability(input: {orchestrationId: string; expectedRevision: number; candidateDir?: string; manifestSha256?: string; producerStatus?: 'required' | 'staged'}): Promise<Record<string, unknown>> {
+    if (input.candidateDir !== undefined && !path.isAbsolute(input.candidateDir)) throw new TraceProductClientError('INVALID_CAPABILITY_PRODUCER', 'candidate_dir must be absolute');
+    return this.request('/api/product/host/capability/stage', {protocolVersion: 1, commandId: hostCommandId('capability-stage', this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, orchestrationId: input.orchestrationId, expectedRevision: input.expectedRevision, ...(input.candidateDir === undefined ? {} : {candidateDir: path.resolve(input.candidateDir)}), ...(input.manifestSha256 === undefined ? {} : {manifestSha256: input.manifestSha256}), ...(input.producerStatus === undefined ? {} : {producerStatus: input.producerStatus})});
+  }
+  validateCapability(input: {orchestrationId: string; expectedRevision: number; validation: Record<string, string>}): Promise<Record<string, unknown>> {
+    return this.request('/api/product/host/capability/validate', {protocolVersion: 1, commandId: hostCommandId('capability-validate', this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, orchestrationId: input.orchestrationId, expectedRevision: input.expectedRevision, validation: input.validation});
+  }
+  publishCapability(input: {orchestrationId: string; expectedRevision: number; approval?: string; policyId?: string; publicationReceipt: Record<string, unknown>; rollbackReceipt: string; producerStatus?: 'published'}): Promise<Record<string, unknown>> {
+    return this.request('/api/product/host/capability/publish', {protocolVersion: 1, commandId: hostCommandId('capability-publish', this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, orchestrationId: input.orchestrationId, expectedRevision: input.expectedRevision, ...(input.approval === undefined ? {} : {approval: input.approval}), ...(input.policyId === undefined ? {} : {policyId: input.policyId}), publicationReceipt: input.publicationReceipt, rollbackReceipt: input.rollbackReceipt, ...(input.producerStatus === undefined ? {} : {producerStatus: input.producerStatus})});
+  }
+  rollbackCapability(input: {orchestrationId: string; expectedRevision: number; rollbackReceipt: string; producerStatus: 'rolled_back'}): Promise<Record<string, unknown>> {
+    return this.request('/api/product/host/capability/rollback', {protocolVersion: 1, commandId: hostCommandId('capability-rollback', this.sessionId, input as unknown as Record<string, unknown>), host: 'codex', sessionId: this.sessionId, orchestrationId: input.orchestrationId, expectedRevision: input.expectedRevision, rollbackReceipt: input.rollbackReceipt, producerStatus: input.producerStatus});
+  }
+}
