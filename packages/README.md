@@ -1,6 +1,6 @@
 # Trace Runtime packages
 
-`packages/` is the reusable runtime and product-domain foundation. The seven groups below are maintainer boundaries, not seven separate user-facing apps or a list users configure one by one. Internal packages stay independently owned where their data, lifecycle, or API requires it.
+`packages/` is the reusable runtime and product-domain foundation. The seven groups below are maintainer boundaries, not seven separate user-facing apps, product modules, or a list users configure one by one. They do not prescribe a product workflow. Internal packages stay independently owned where their data, lifecycle, or API requires it.
 
 ## Seven package groups
 
