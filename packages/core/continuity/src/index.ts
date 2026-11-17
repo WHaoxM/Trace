@@ -1,0 +1,501 @@
+import {createHash} from 'node:crypto';
+import {optionalStringList as stringList, ProtocolError, ProtocolVersionRegistry, rejectUnknown, requireObject as object, requireText as text, type ProtocolVersioned} from '../../protocol/src/index.js';
+import type {VersionedStore} from '../../storage/src/index.js';
+
+export const CONTINUITY_PROTOCOL_ID = 'trace.continuity' as const;
+export const CONTINUITY_PROTOCOL_VERSION = '0.3.0' as const;
+export const CONTINUITY_KINDS = ['thread', 'discussion_turn', 'persistence_receipt', 'activation_receipt', 'decision_point'] as const;
+export type ContinuityKind = (typeof CONTINUITY_KINDS)[number];
+export type ThreadStatus = 'open' | 'watching' | 'resolved' | 'published' | 'superseded';
+export type DeltaType = 'none' | 'new_candidate' | 'revision' | 'adoption' | 'rejection' | 'publication';
+export type DecisionStatus = 'pending' | 'decided' | 'superseded';
+export type VisibilityMode = 'summary' | 'evidence' | 'audit';
+
+/** Safe, durable audit identity for a pointer-only source activation.
+ * Absolute host paths and source bodies deliberately do not belong here. */
+export interface ActivatedPointer {
+  source_id: string;
+  locator: string;
+  revision: number;
+  content_hash: string;
+  purpose: string;
+  priority: 'must' | 'should' | 'optional';
+  stop_condition: string;
+}
+
+export interface ContinuityEnvelope {
+  protocol_id: typeof CONTINUITY_PROTOCOL_ID;
+  protocol_version: typeof CONTINUITY_PROTOCOL_VERSION;
+  record_id: string;
+  revision: number;
+  kind: ContinuityKind;
+  thread_id: string;
+  correlation_id: string;
+  causation_id: string;
+  visibility: VisibilityMode;
+  payload: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  record_id_key?: string;
+}
+
+export interface CreateThread {
+  thread_id?: string;
+  title: string;
+  status?: ThreadStatus;
+  current_summary: string;
+  candidate_refs?: string[];
+  adopted_refs?: string[];
+  open_questions?: string[];
+  next_action?: string;
+  correlation_id?: string;
+  causation_id?: string;
+}
+
+export interface UpdateThread {
+  expected_revision: number;
+  status?: ThreadStatus;
+  current_summary?: string;
+  candidate_refs?: string[];
+  adopted_refs?: string[];
+  open_questions?: string[];
+  next_action?: string;
+}
+
+export interface CreateDiscussionTurn {
+  thread_id: string;
+  user_input_summary: string;
+  output_summary: string;
+  delta_type: DeltaType;
+  context_refs?: string[];
+  persisted_refs?: string[];
+  open_questions?: string[];
+  correlation_id?: string;
+  causation_id?: string;
+}
+
+export interface CreateReceipt {
+  thread_id: string;
+  receipt_kind: 'persistence' | 'activation';
+  summary: string;
+  persisted_refs?: string[];
+  not_persisted?: string[];
+  activated_refs?: string[];
+  activated_pointers?: ActivatedPointer[];
+  required_user_action?: string;
+  next_prompts?: string[];
+  correlation_id?: string;
+  causation_id?: string;
+}
+
+const THREAD_STATUSES: readonly ThreadStatus[] = ['open', 'watching', 'resolved', 'published', 'superseded'];
+const DELTA_TYPES: readonly DeltaType[] = ['none', 'new_candidate', 'revision', 'adoption', 'rejection', 'publication'];
+const DECISION_STATUSES: readonly DecisionStatus[] = ['pending', 'decided', 'superseded'];
+
+function digest(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 20);
+}
+
+function timestamp(): string { return new Date().toISOString(); }
+
+type AnyContinuityProtocol = ProtocolVersioned & Record<string, unknown>;
+
+const continuityUpcasters = new ProtocolVersionRegistry<AnyContinuityProtocol>();
+continuityUpcasters.register({
+  protocol_id: CONTINUITY_PROTOCOL_ID,
+  from_version: '0.1.0',
+  to_version: '0.2.0',
+  upcast(value) {
+    const recordId = typeof value.record_id === 'string' ? value.record_id : 'unknown';
+    const revision = Number.isInteger(value.revision) ? String(value.revision) : 'unknown';
+    return {
+      ...value,
+      protocol_version: '0.2.0',
+      correlation_id: `legacy-continuity:${recordId}`,
+      causation_id: `legacy-continuity:${recordId}@${revision}`,
+    };
+  },
+});
+continuityUpcasters.register({
+  protocol_id: CONTINUITY_PROTOCOL_ID,
+  from_version: '0.2.0',
+  to_version: CONTINUITY_PROTOCOL_VERSION,
+  upcast(value) {
+    // 0.3.0 only adds the decision_point kind; existing 0.2.0 records are unchanged.
+    return {...value, protocol_version: CONTINUITY_PROTOCOL_VERSION};
+  },
+});
+
+function lineageFor(kind: ContinuityKind, threadId: string, payload: Record<string, unknown>, input: {correlation_id?: string; causation_id?: string}): {correlation_id: string; causation_id: string} {
+  const correlationId = input.correlation_id === undefined ? `continuity-thread:${threadId}` : text(input.correlation_id, 'correlation_id', 240);
+  const causationId = input.causation_id === undefined ? `continuity-${kind}:${digest({threadId, payload})}` : text(input.causation_id, 'causation_id', 240);
+  return {correlation_id: correlationId, causation_id: causationId};
+}
+
+function isRelativeLocator(value: string): boolean {
+  return value.length > 0
+    && !value.startsWith('/')
+    && !value.startsWith('\\')
+    && !/^[A-Za-z]:[\\/]/.test(value)
+    && !value.replaceAll('\\', '/').split('/').some(part => part === '' || part === '.' || part === '..');
+}
+
+function activationPointers(value: unknown): ActivatedPointer[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 128) throw new ProtocolError('INVALID_FIELD', 'activated_pointers must contain at most 128 pointers');
+  return value.map((raw, index) => {
+    const item = object(raw, `activated_pointers[${index}]`);
+    rejectUnknown(item, ['source_id', 'locator', 'revision', 'content_hash', 'purpose', 'priority', 'stop_condition'], `activated_pointers[${index}]`);
+    const locator = text(item.locator, `activated_pointers[${index}].locator`, 2000);
+    if (!isRelativeLocator(locator)) throw new ProtocolError('INVALID_FIELD', `activated_pointers[${index}].locator must be a safe relative locator`);
+    if (!Number.isInteger(item.revision) || Number(item.revision) < 1) throw new ProtocolError('INVALID_FIELD', `activated_pointers[${index}].revision must be positive`);
+    const contentHash = text(item.content_hash, `activated_pointers[${index}].content_hash`, 64);
+    if (!/^[a-f0-9]{64}$/i.test(contentHash)) throw new ProtocolError('INVALID_FIELD', `activated_pointers[${index}].content_hash must be a SHA-256 hex digest`);
+    if (item.priority !== 'must' && item.priority !== 'should' && item.priority !== 'optional') throw new ProtocolError('INVALID_FIELD', `activated_pointers[${index}].priority is invalid`);
+    return {
+      source_id: text(item.source_id, `activated_pointers[${index}].source_id`, 240),
+      locator,
+      revision: Number(item.revision),
+      content_hash: contentHash.toLowerCase(),
+      purpose: text(item.purpose, `activated_pointers[${index}].purpose`, 1000),
+      priority: item.priority as ActivatedPointer['priority'],
+      stop_condition: text(item.stop_condition, `activated_pointers[${index}].stop_condition`, 1000),
+    };
+  });
+}
+
+function buildEnvelope(kind: ContinuityKind, threadId: string, payload: Record<string, unknown>, recordId: string | undefined, lineage: {correlation_id?: string; causation_id?: string}): ContinuityEnvelope {
+  const now = timestamp();
+  const identity = recordId ?? `continuity-${kind}-${digest({threadId, payload})}`;
+  const trace = lineageFor(kind, threadId, payload, lineage);
+  return validateContinuityEnvelope({
+    protocol_id: CONTINUITY_PROTOCOL_ID,
+    protocol_version: CONTINUITY_PROTOCOL_VERSION,
+    record_id: identity,
+    revision: 1,
+    kind,
+    thread_id: threadId,
+    correlation_id: trace.correlation_id,
+    causation_id: trace.causation_id,
+    visibility: 'summary',
+    payload,
+    created_at: now,
+    updated_at: now,
+  });
+}
+
+export function validateContinuityEnvelope(value: unknown): ContinuityEnvelope {
+  const raw = object(value, 'continuity_envelope');
+  if (raw.protocol_id !== CONTINUITY_PROTOCOL_ID) throw new ProtocolError('PROTOCOL_MISMATCH', 'Unsupported continuity protocol');
+  const item = raw.protocol_version === CONTINUITY_PROTOCOL_VERSION
+    ? raw
+    : continuityUpcasters.upgrade(raw as AnyContinuityProtocol, CONTINUITY_PROTOCOL_VERSION) as Record<string, unknown>;
+  rejectUnknown(item, ['protocol_id', 'protocol_version', 'record_id', 'revision', 'kind', 'thread_id', 'correlation_id', 'causation_id', 'visibility', 'payload', 'created_at', 'updated_at'], 'continuity_envelope');
+  if (item.protocol_version !== CONTINUITY_PROTOCOL_VERSION) throw new ProtocolError('PROTOCOL_MIGRATION_REQUIRED', `Unsupported continuity protocol version: ${String(item.protocol_version)}`);
+  if (!Number.isInteger(item.revision) || Number(item.revision) < 1) throw new ProtocolError('INVALID_FIELD', 'continuity revision must be positive');
+  if (!CONTINUITY_KINDS.includes(item.kind as ContinuityKind)) throw new ProtocolError('INVALID_FIELD', 'continuity kind is not supported');
+  if (item.visibility !== 'summary' && item.visibility !== 'evidence' && item.visibility !== 'audit') throw new ProtocolError('INVALID_FIELD', 'visibility is not supported');
+  const payload = object(item.payload, 'payload');
+  const kind = item.kind as ContinuityKind;
+  const allowed: Record<ContinuityKind, readonly string[]> = {
+    thread: ['title', 'status', 'current_summary', 'candidate_refs', 'adopted_refs', 'open_questions', 'next_action'],
+    discussion_turn: ['user_input_summary', 'output_summary', 'delta_type', 'context_refs', 'persisted_refs', 'open_questions'],
+    persistence_receipt: ['summary', 'persisted_refs', 'not_persisted', 'required_user_action', 'next_prompts'],
+    activation_receipt: ['summary', 'activated_refs', 'activated_pointers', 'not_persisted', 'required_user_action', 'next_prompts'],
+    decision_point: ['prompt', 'options', 'status', 'chosen', 'rationale', 'round', 'parent_decision_id', 'related_refs'],
+  };
+  rejectUnknown(payload, allowed[kind], `${kind}.payload`);
+  if (kind === 'thread') {
+    if (!THREAD_STATUSES.includes(payload.status as ThreadStatus)) throw new ProtocolError('INVALID_FIELD', 'thread.status is not supported');
+    text(payload.title, 'thread.title', 300); text(payload.current_summary, 'thread.current_summary');
+    stringList(payload.candidate_refs, 'thread.candidate_refs'); stringList(payload.adopted_refs, 'thread.adopted_refs'); stringList(payload.open_questions, 'thread.open_questions');
+    if (payload.next_action !== undefined) text(payload.next_action, 'thread.next_action', 1000);
+  } else if (kind === 'discussion_turn') {
+    text(payload.user_input_summary, 'discussion_turn.user_input_summary'); text(payload.output_summary, 'discussion_turn.output_summary');
+    if (!DELTA_TYPES.includes(payload.delta_type as DeltaType)) throw new ProtocolError('INVALID_FIELD', 'discussion_turn.delta_type is not supported');
+    stringList(payload.context_refs, 'discussion_turn.context_refs'); stringList(payload.persisted_refs, 'discussion_turn.persisted_refs'); stringList(payload.open_questions, 'discussion_turn.open_questions');
+  } else if (kind === 'decision_point') {
+    text(payload.prompt, 'decision_point.prompt');
+    const options = stringList(payload.options, 'decision_point.options');
+    if (options.length === 0) throw new ProtocolError('INVALID_FIELD', 'decision_point.options must not be empty');
+    if (!DECISION_STATUSES.includes(payload.status as DecisionStatus)) throw new ProtocolError('INVALID_FIELD', 'decision_point.status is not supported');
+    if (payload.status === 'decided') {
+      const chosen = text(payload.chosen, 'decision_point.chosen', 300);
+      if (!options.includes(chosen)) throw new ProtocolError('INVALID_FIELD', 'decision_point.chosen must be one of its options');
+      // A decision without its reason is a dead end; the rationale is what
+      // lets a rejection feed back into later proposals.
+      text(payload.rationale, 'decision_point.rationale');
+    } else {
+      if (payload.chosen !== undefined) text(payload.chosen, 'decision_point.chosen', 300);
+      if (payload.rationale !== undefined) text(payload.rationale, 'decision_point.rationale');
+    }
+    if (!Number.isInteger(payload.round) || Number(payload.round) < 1) throw new ProtocolError('INVALID_FIELD', 'decision_point.round must be a positive integer');
+    if (payload.parent_decision_id !== undefined) text(payload.parent_decision_id, 'decision_point.parent_decision_id', 240);
+    stringList(payload.related_refs, 'decision_point.related_refs');
+  } else {
+    text(payload.summary, `${kind}.summary`); stringList(payload.persisted_refs, `${kind}.persisted_refs`); stringList(payload.activated_refs, `${kind}.activated_refs`); if (kind === 'activation_receipt') activationPointers(payload.activated_pointers); stringList(payload.not_persisted, `${kind}.not_persisted`); stringList(payload.next_prompts, `${kind}.next_prompts`);
+    if (payload.required_user_action !== undefined) text(payload.required_user_action, `${kind}.required_user_action`, 1000);
+  }
+  return {
+    protocol_id: CONTINUITY_PROTOCOL_ID,
+    protocol_version: CONTINUITY_PROTOCOL_VERSION,
+    record_id: text(item.record_id, 'record_id', 240),
+    revision: Number(item.revision),
+    kind,
+    thread_id: text(item.thread_id, 'thread_id', 240),
+    correlation_id: text(item.correlation_id, 'correlation_id', 240),
+    causation_id: text(item.causation_id, 'causation_id', 240),
+    visibility: item.visibility as VisibilityMode,
+    payload,
+    created_at: text(item.created_at, 'created_at', 80),
+    updated_at: text(item.updated_at, 'updated_at', 80),
+  };
+}
+
+export class ContinuityLedger {
+  constructor(readonly store: VersionedStore<ContinuityEnvelope>) {}
+
+  private latest(): ContinuityEnvelope[] { return this.store.latest().map(value => validateContinuityEnvelope(value)); }
+
+  createThread(input: CreateThread): ContinuityEnvelope {
+    const title = text(input.title, 'title', 300);
+    const threadId = input.thread_id ?? `thread-${digest({title, summary: input.current_summary})}`;
+    const record = buildEnvelope('thread', threadId, {
+      title,
+      status: input.status ?? 'open',
+      current_summary: text(input.current_summary, 'current_summary'),
+      candidate_refs: stringList(input.candidate_refs, 'candidate_refs'),
+      adopted_refs: stringList(input.adopted_refs, 'adopted_refs'),
+      open_questions: stringList(input.open_questions, 'open_questions'),
+      ...(input.next_action === undefined ? {} : {next_action: text(input.next_action, 'next_action', 1000)}),
+    }, threadId, input);
+    return validateContinuityEnvelope(this.store.appendIfAbsent(record).record);
+  }
+
+  getThread(threadId: string): ContinuityEnvelope {
+    const raw = this.store.read(threadId);
+    const found = raw === undefined ? undefined : validateContinuityEnvelope(raw);
+    if (found?.kind !== 'thread' || found.thread_id !== threadId) throw new ProtocolError('NOT_FOUND', `Unknown continuity thread: ${threadId}`);
+    return found;
+  }
+
+  updateThread(threadId: string, input: UpdateThread): ContinuityEnvelope {
+    const next = this.store.compareAndSwap(threadId, input.expected_revision, current => {
+      const currentRecord = validateContinuityEnvelope(current);
+      if (currentRecord.kind !== 'thread') throw new ProtocolError('INVALID_FIELD', `${threadId} is not a thread`);
+      const payload = currentRecord.payload;
+      const updated: ContinuityEnvelope = {
+        ...currentRecord,
+        revision: currentRecord.revision + 1,
+        updated_at: timestamp(),
+        payload: {
+          ...payload,
+          ...(input.status === undefined ? {} : {status: input.status}),
+          ...(input.current_summary === undefined ? {} : {current_summary: text(input.current_summary, 'current_summary')}),
+          ...(input.candidate_refs === undefined ? {} : {candidate_refs: stringList(input.candidate_refs, 'candidate_refs')}),
+          ...(input.adopted_refs === undefined ? {} : {adopted_refs: stringList(input.adopted_refs, 'adopted_refs')}),
+          ...(input.open_questions === undefined ? {} : {open_questions: stringList(input.open_questions, 'open_questions')}),
+          ...(input.next_action === undefined ? {} : {next_action: text(input.next_action, 'next_action', 1000)}),
+        },
+      };
+      return validateContinuityEnvelope(updated);
+    });
+    return validateContinuityEnvelope(next);
+  }
+
+  appendTurn(input: CreateDiscussionTurn): ContinuityEnvelope {
+    this.getThread(input.thread_id);
+    const record = buildEnvelope('discussion_turn', input.thread_id, {
+      user_input_summary: text(input.user_input_summary, 'user_input_summary'),
+      output_summary: text(input.output_summary, 'output_summary'),
+      delta_type: input.delta_type,
+      context_refs: stringList(input.context_refs, 'context_refs'),
+      persisted_refs: stringList(input.persisted_refs, 'persisted_refs'),
+      open_questions: stringList(input.open_questions, 'open_questions'),
+    }, undefined, input);
+    return validateContinuityEnvelope(this.store.appendIfAbsent(record).record);
+  }
+
+  createReceipt(input: CreateReceipt): ContinuityEnvelope {
+    this.getThread(input.thread_id);
+    if (input.receipt_kind !== 'persistence' && input.receipt_kind !== 'activation') throw new ProtocolError('INVALID_FIELD', 'receipt_kind must be persistence or activation');
+    const kind: ContinuityKind = input.receipt_kind === 'persistence' ? 'persistence_receipt' : 'activation_receipt';
+    const record = buildEnvelope(kind, input.thread_id, {
+      summary: text(input.summary, 'summary'),
+      ...(input.persisted_refs === undefined ? {} : {persisted_refs: stringList(input.persisted_refs, 'persisted_refs')}),
+      ...(input.activated_refs === undefined ? {} : {activated_refs: stringList(input.activated_refs, 'activated_refs')}),
+      ...(input.receipt_kind !== 'activation' || input.activated_pointers === undefined ? {} : {activated_pointers: activationPointers(input.activated_pointers)}),
+      ...(input.not_persisted === undefined ? {} : {not_persisted: stringList(input.not_persisted, 'not_persisted')}),
+      ...(input.required_user_action === undefined ? {} : {required_user_action: text(input.required_user_action, 'required_user_action', 1000)}),
+      ...(input.next_prompts === undefined ? {} : {next_prompts: stringList(input.next_prompts, 'next_prompts')}),
+    }, undefined, input);
+    return validateContinuityEnvelope(this.store.appendIfAbsent(record).record);
+  }
+
+  list(threadId?: string): ContinuityEnvelope[] {
+    return this.latest().filter(item => threadId === undefined || item.thread_id === threadId).sort((a, b) => a.created_at.localeCompare(b.created_at));
+  }
+}
+
+export interface CreateDecisionPoint {
+  thread_id: string;
+  prompt: string;
+  options: string[];
+  round?: number;
+  parent_decision_id?: string;
+  related_refs?: string[];
+  correlation_id?: string;
+  causation_id?: string;
+}
+
+export interface ResolveDecisionPoint {
+  expected_revision: number;
+  chosen: string;
+  rationale: string;
+}
+
+export interface ReviseDecisionPoint {
+  expected_revision: number;
+  prompt: string;
+  options: string[];
+  /** Why the previous round was not adopted; stored on the superseded node. */
+  rationale: string;
+  related_refs?: string[];
+  correlation_id?: string;
+  causation_id?: string;
+}
+
+export interface DecisionPathNode {
+  record_id: string;
+  revision: number;
+  thread_id: string;
+  prompt: string;
+  options: string[];
+  status: DecisionStatus;
+  chosen: string | null;
+  rationale: string | null;
+  round: number;
+  parent_decision_id: string | null;
+  related_refs: string[];
+  created_at: string;
+}
+
+/** The 择路 view of one thread: every fork presented, the road taken, and the roads not taken. */
+export interface DecisionPath {
+  thread_id: string;
+  nodes: DecisionPathNode[];
+  pending: DecisionPathNode[];
+  taken: Array<{record_id: string; chosen: string; rationale: string}>;
+}
+
+function decisionNode(record: ContinuityEnvelope): DecisionPathNode {
+  const payload = record.payload;
+  return {
+    record_id: record.record_id,
+    revision: record.revision,
+    thread_id: record.thread_id,
+    prompt: payload.prompt as string,
+    options: payload.options as string[],
+    status: payload.status as DecisionStatus,
+    chosen: typeof payload.chosen === 'string' ? payload.chosen : null,
+    rationale: typeof payload.rationale === 'string' ? payload.rationale : null,
+    round: Number(payload.round),
+    parent_decision_id: typeof payload.parent_decision_id === 'string' ? payload.parent_decision_id : null,
+    related_refs: (payload.related_refs as string[] | undefined) ?? [],
+    created_at: record.created_at,
+  };
+}
+
+/**
+ * Decision trail: every decision presented to the user is a visible fork.
+ * Resolving records the chosen branch with its rationale; revising creates a
+ * child node instead of overwriting, so the negotiation itself is the chain.
+ */
+export class DecisionTrail {
+  constructor(readonly ledger: ContinuityLedger) {}
+
+  private decisions(threadId?: string): ContinuityEnvelope[] {
+    return this.ledger.list(threadId).filter(record => record.kind === 'decision_point');
+  }
+
+  getDecision(recordId: string): ContinuityEnvelope {
+    const raw = this.ledger.store.read(recordId);
+    const found = raw === undefined ? undefined : validateContinuityEnvelope(raw);
+    if (found?.kind !== 'decision_point') throw new ProtocolError('NOT_FOUND', `Unknown decision point: ${recordId}`);
+    return found;
+  }
+
+  createDecisionPoint(input: CreateDecisionPoint): ContinuityEnvelope {
+    this.ledger.getThread(input.thread_id);
+    if (input.options.length === 0) throw new ProtocolError('INVALID_FIELD', 'decision options must not be empty');
+    if (input.parent_decision_id !== undefined) {
+      const parent = this.getDecision(input.parent_decision_id);
+      if (parent.thread_id !== input.thread_id) throw new ProtocolError('INVALID_FIELD', 'parent decision belongs to a different thread');
+    }
+    const record = buildEnvelope('decision_point', input.thread_id, {
+      prompt: text(input.prompt, 'prompt'),
+      options: stringList(input.options, 'options'),
+      status: 'pending',
+      round: input.round ?? 1,
+      ...(input.parent_decision_id === undefined ? {} : {parent_decision_id: text(input.parent_decision_id, 'parent_decision_id', 240)}),
+      related_refs: stringList(input.related_refs, 'related_refs'),
+    }, undefined, input);
+    return validateContinuityEnvelope(this.ledger.store.appendIfAbsent(record).record);
+  }
+
+  resolveDecisionPoint(recordId: string, input: ResolveDecisionPoint): ContinuityEnvelope {
+    const next = this.ledger.store.compareAndSwap(recordId, input.expected_revision, current => {
+      const currentRecord = validateContinuityEnvelope(current);
+      if (currentRecord.kind !== 'decision_point') throw new ProtocolError('INVALID_FIELD', `${recordId} is not a decision point`);
+      if (currentRecord.payload.status !== 'pending') throw new ProtocolError('INVALID_TRANSITION', `decision point ${recordId} is already ${String(currentRecord.payload.status)}`);
+      return validateContinuityEnvelope({
+        ...currentRecord,
+        revision: currentRecord.revision + 1,
+        updated_at: timestamp(),
+        payload: {...currentRecord.payload, status: 'decided', chosen: text(input.chosen, 'chosen', 300), rationale: text(input.rationale, 'rationale')},
+      });
+    });
+    return validateContinuityEnvelope(next);
+  }
+
+  /** Supersede the current node and fork a child with the revised prompt/options. */
+  reviseDecisionPoint(recordId: string, input: ReviseDecisionPoint): ContinuityEnvelope {
+    const superseded = this.ledger.store.compareAndSwap(recordId, input.expected_revision, current => {
+      const currentRecord = validateContinuityEnvelope(current);
+      if (currentRecord.kind !== 'decision_point') throw new ProtocolError('INVALID_FIELD', `${recordId} is not a decision point`);
+      if (currentRecord.payload.status !== 'pending') throw new ProtocolError('INVALID_TRANSITION', `decision point ${recordId} is already ${String(currentRecord.payload.status)}`);
+      return validateContinuityEnvelope({
+        ...currentRecord,
+        revision: currentRecord.revision + 1,
+        updated_at: timestamp(),
+        payload: {...currentRecord.payload, status: 'superseded', rationale: text(input.rationale, 'rationale')},
+      });
+    });
+    const parent = validateContinuityEnvelope(superseded);
+    const inheritedRefs = input.related_refs ?? (parent.payload.related_refs as string[] | undefined);
+    return this.createDecisionPoint({
+      thread_id: parent.thread_id,
+      prompt: input.prompt,
+      options: input.options,
+      round: Number(parent.payload.round) + 1,
+      parent_decision_id: recordId,
+      ...(inheritedRefs === undefined ? {} : {related_refs: inheritedRefs}),
+      ...(input.correlation_id === undefined ? {} : {correlation_id: input.correlation_id}),
+      ...(input.causation_id === undefined ? {} : {causation_id: input.causation_id}),
+    });
+  }
+
+  pendingFor(threadId?: string): DecisionPathNode[] {
+    return this.decisions(threadId).filter(record => record.payload.status === 'pending').map(decisionNode);
+  }
+
+  pathFor(threadId: string): DecisionPath {
+    const nodes = this.decisions(threadId).map(decisionNode);
+    return {
+      thread_id: threadId,
+      nodes,
+      pending: nodes.filter(node => node.status === 'pending'),
+      taken: nodes.filter(node => node.status === 'decided').map(node => ({record_id: node.record_id, chosen: node.chosen!, rationale: node.rationale!})),
+    };
+  }
+}
